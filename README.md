@@ -21,6 +21,8 @@ All data is stored in this browser's `localStorage` under the key `foodTracker.v
 | `app.js` | All app logic: storage, nutrition math, views, online lookup |
 | `tests.html` | Open in a browser to run the calculation and acceptance tests (does not touch saved data) |
 
+`index.html` loads `app.js?v=N` and `styles.css?v=N`. Bump `N` whenever those files change so browsers fetch the new version instead of a cached copy.
+
 ## How the numbers work
 
 - **Entering foods:** type the values straight from the nutrition label, per serving (e.g. "1 cup" = 240 mL, 120 kcal). A toggle switches to per-100 entry, and switching converts what you've typed. Each food is measured either by weight (g) or by volume (mL).
