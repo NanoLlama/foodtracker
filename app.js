@@ -657,9 +657,6 @@
   const views = {};
   const actions = {};
 
-  function placeholder(name) {
-    return (root) => { root.innerHTML = `<div class="card"><h2>${esc(name)}</h2><p class="muted">Coming soon.</p></div>`; };
-  }
   // ---------------------------------------------------------------------
   // Shared nutrition display snippets
   // ---------------------------------------------------------------------
@@ -1710,7 +1707,163 @@
     saveData();
     render();
   };
-  views.history = placeholder('History');
+  // ---------------------------------------------------------------------
+  // History & trends
+  // ---------------------------------------------------------------------
+  function dayStatus(k) {
+    const entries = entriesFor(k);
+    if (!entries.length) return null;
+    const eaten = sumNutrition(entries.map((e) => e.nutrition)).kcal;
+    const target = targetForDate(k);
+    return { date: k, eaten, target, over: isNum(target) ? eaten > target : null };
+  }
+
+  /** Averages over logged days in the `days`-day window ending at `endKey` (inclusive). */
+  function windowStats(endKey, days) {
+    const logged = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const st = dayStatus(addDays(endKey, -i));
+      if (st) logged.push(st);
+    }
+    const n = logged.length;
+    const tdee = calcTdee(data.settings.profile);
+    const withTarget = logged.filter((d) => isNum(d.target));
+    const avg = (arr, f) => (arr.length ? arr.reduce((a, d) => a + f(d), 0) / arr.length : null);
+    return {
+      start: addDays(endKey, -(days - 1)), end: endKey, days, logged: n,
+      avgEaten: avg(logged, (d) => d.eaten),
+      avgTarget: avg(withTarget, (d) => d.target),
+      avgVsTarget: avg(withTarget, (d) => d.eaten - d.target),
+      daysOver: withTarget.filter((d) => d.over).length,
+      tdee,
+      avgDeficit: isNum(tdee) && n ? avg(logged, (d) => tdee - d.eaten) : null,
+    };
+  }
+
+  function weekChartSvg(endKey, W) {
+    const H = 220, L = 40, R = 8, T = 22, B = 30;
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+      const k = addDays(endKey, -i);
+      const st = dayStatus(k);
+      days.push({ k, eaten: st ? st.eaten : null, target: targetForDate(k) });
+    }
+    const yMax = Math.max(500, ...days.map((d) => Math.max(d.eaten || 0, isNum(d.target) ? d.target : 0))) * 1.12;
+    const sy = (v) => T + (1 - v / yMax) * (H - T - B);
+    const slot = (W - L - R) / 7;
+    const bw = Math.min(44, slot * 0.62);
+    let g = '';
+    niceTicks(0, yMax, 4).forEach((v) => {
+      g += `<line class="grid" x1="${L}" x2="${W - R}" y1="${sy(v)}" y2="${sy(v)}"/><text x="${L - 6}" y="${sy(v) + 4}" text-anchor="end">${v >= 1000 ? fmtQty(v / 1000) + 'k' : fmtQty(v)}</text>`;
+    });
+    days.forEach((d, i) => {
+      const cx = L + slot * i + slot / 2;
+      const x = cx - bw / 2;
+      const label = parseKey(d.k).toLocaleDateString(undefined, { weekday: 'short' });
+      const isToday = d.k === todayKey();
+      let tip = `${fmtDate(d.k, { weekday: 'short', month: 'short', day: 'numeric' })}: `;
+      if (isNum(d.eaten)) {
+        const over = isNum(d.target) && d.eaten > d.target;
+        const top = sy(d.eaten);
+        const h = Math.max(2, H - B - top);
+        const r = Math.min(4, bw / 2, h);
+        g += `<path class="${isNum(d.target) ? (over ? 'bar-over' : 'bar-under') : 'bar-none'}" d="M${x},${H - B}V${top + r}Q${x},${top} ${x + r},${top}H${x + bw - r}Q${x + bw},${top} ${x + bw},${top + r}V${H - B}Z"/>`;
+        const labelY = Math.min(top, isNum(d.target) ? sy(d.target) : top) - 5;
+        g += `<text class="bar-label" x="${cx}" y="${labelY}" text-anchor="middle">${fmtKcal(d.eaten)}</text>`;
+        tip += `${fmtKcal(d.eaten)} kcal` + (isNum(d.target) ? ` of ${fmtKcal(d.target)} target (${fmtSigned(d.eaten - d.target, fmtKcal)})` : '');
+      } else {
+        tip += 'nothing logged';
+      }
+      if (isNum(d.target)) g += `<line class="target" x1="${cx - slot * 0.45}" x2="${cx + slot * 0.45}" y1="${sy(d.target)}" y2="${sy(d.target)}"/>`;
+      g += `<text x="${cx}" y="${H - 10}" text-anchor="middle" ${isToday ? 'style="font-weight:700"' : ''}>${esc(label)}</text>`;
+      g += `<rect x="${cx - slot / 2}" y="${T}" width="${slot}" height="${H - T - B}" fill="transparent" data-goto="${d.k}" style="cursor:pointer"><title>${esc(tip)}</title></rect>`;
+    });
+    return `<svg class="chart" viewBox="0 0 ${W} ${H}" width="${W}" role="img" aria-label="Calories per day for the last 7 days against target">${g}</svg>`;
+  }
+
+  function calendarHtml(monthKey) {
+    const first = parseKey(monthKey);
+    const y = first.getFullYear();
+    const m = first.getMonth();
+    const daysIn = new Date(y, m + 1, 0).getDate();
+    // Monday-first grid
+    const lead = (first.getDay() + 6) % 7;
+    const today = todayKey();
+    let cells = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((d) => `<div class="dow">${d}</div>`).join('');
+    for (let i = 0; i < lead; i++) cells += '<div class="day blank"></div>';
+    for (let d = 1; d <= daysIn; d++) {
+      const k = dateKey(new Date(y, m, d));
+      const st = dayStatus(k);
+      const cls = ['day'];
+      if (st && st.over === true) cls.push('over');
+      else if (st && st.over === false) cls.push('under');
+      if (k === today) cls.push('today');
+      if (k > today) cls.push('future');
+      const state = st ? (st.over === true ? 'over target' : st.over === false ? 'under target' : 'no target') : 'nothing logged';
+      cells += `<button type="button" class="${cls.join(' ')}" ${k > today ? 'disabled' : `data-goto="${k}"`} aria-label="${esc(fmtDate(k))}: ${st ? fmtKcal(st.eaten) + ' kcal, ' : ''}${state}">
+        <span class="d">${d}</span>${st ? `<span class="k">${fmtKcal(st.eaten)}</span>${st.over === true ? '<span class="k" aria-hidden="true">▲</span>' : st.over === false ? '<span class="k" aria-hidden="true">✓</span>' : ''}` : ''}</button>`;
+    }
+    return `<div class="calendar">${cells}</div>`;
+  }
+
+  ui.histMonth = null;
+  ui.includeToday = false;
+  views.history = function (root) {
+    const today = todayKey();
+    if (!ui.histMonth) ui.histMonth = today.slice(0, 8) + '01';
+    const end = ui.includeToday ? today : addDays(today, -1);
+    const s7 = windowStats(end, 7);
+    const s30 = windowStats(end, 30);
+    const range = (st) => `${fmtDate(st.start, { month: 'short', day: 'numeric' })} – ${fmtDate(st.end, { month: 'short', day: 'numeric' })}`;
+    const vs = (v) => (isNum(v) ? `${fmtSigned(v, fmtKcal)} kcal` : '—');
+    const row = (label, f) => `<tr><td>${label}</td><td>${f(s7)}</td><td>${f(s30)}</td></tr>`;
+    const monthName = parseKey(ui.histMonth).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    const thisMonth = today.slice(0, 8) + '01';
+    root.innerHTML = `
+      <div class="card">
+        <div class="card-head"><h2>Last 7 days</h2></div>
+        ${weekChartSvg(today, chartWidth(root))}
+        <div class="legend"><span><i style="background:var(--good)"></i>At or under target</span><span><i style="background:var(--danger)"></i>Over target</span><span><i style="background:var(--text);height:2px"></i>Daily target</span></div>
+        <p>Weekly average: <b>${s7.logged ? fmtKcal(s7.avgEaten) + ' kcal/day' : '—'}</b>${isNum(s7.avgVsTarget) ? ` <span class="muted">(${vs(s7.avgVsTarget)} vs. target)</span>` : ''}
+          <br><span class="small muted">${range(s7)}, ${s7.logged} logged day${s7.logged === 1 ? '' : 's'}.</span></p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Averages</h2>
+          <label class="row small"><input type="checkbox" id="h-today" ${ui.includeToday ? 'checked' : ''} style="width:20px;height:20px"> Include today</label></div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th></th><th>7 days<br><span class="muted">${range(s7)}</span></th><th>30 days<br><span class="muted">${range(s30)}</span></th></tr></thead>
+          <tbody>
+            ${row('Days logged', (st) => `${st.logged}/${st.days}`)}
+            ${row('Avg calories', (st) => (st.logged ? fmtKcal(st.avgEaten) + ' kcal' : '—'))}
+            ${row('Avg target', (st) => (isNum(st.avgTarget) ? fmtKcal(st.avgTarget) + ' kcal' : '—'))}
+            ${row('Avg vs. target', (st) => vs(st.avgVsTarget))}
+            ${row('Days over target', (st) => (isNum(st.avgTarget) ? String(st.daysOver) : '—'))}
+            ${row('Avg daily deficit', (st) => (isNum(st.avgDeficit) ? fmtKcal(st.avgDeficit) + ' kcal' : '—'))}
+          </tbody>
+        </table></div>
+        <p class="small muted">Averages use only days with at least one entry, so unlogged days don't count as zero.
+          “vs. target” is negative when you ate under target. “Avg deficit” is your current TDEE${isNum(s7.tdee) ? ` (${fmtKcal(s7.tdee)} kcal)` : ' (set your profile in Settings)'} minus average intake.
+          ${ui.includeToday ? '' : 'Today is excluded because it is still in progress.'}</p>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <button type="button" class="btn icon" data-action="month-prev" aria-label="Previous month">‹</button>
+          <h2 style="text-align:center">${esc(monthName)}</h2>
+          <button type="button" class="btn icon" data-action="month-next" aria-label="Next month" ${ui.histMonth >= thisMonth ? 'disabled' : ''}>›</button>
+        </div>
+        ${calendarHtml(ui.histMonth)}
+        <p class="small muted">Green ✓ = at or under that day's target, red ▲ = over. Tap a day to open it.</p>
+      </div>`;
+    root.querySelector('#h-today').addEventListener('change', (ev) => { ui.includeToday = ev.target.checked; render(); });
+    // Assigned (not added) because the view root persists across renders.
+    root.onclick = (ev) => {
+      const g = ev.target.closest('[data-goto]');
+      if (g) { ui.date = g.getAttribute('data-goto'); setView('today'); }
+    };
+  };
+  const shiftMonth = (n) => { const d = parseKey(ui.histMonth); d.setMonth(d.getMonth() + n, 1); ui.histMonth = dateKey(d); render(); };
+  actions['month-prev'] = () => shiftMonth(-1);
+  actions['month-next'] = () => shiftMonth(1);
 
   // ---------------------------------------------------------------------
   // Settings view
