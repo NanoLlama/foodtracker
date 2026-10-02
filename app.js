@@ -631,7 +631,7 @@
           <button type="button" class="btn ghost icon" data-close aria-label="Close">✕</button></div>
         <div class="modal-body">${bodyHtml}</div>
         ${footHtml ? `<div class="modal-foot">${footHtml}</div>` : ''}`;
-      dlg.querySelector('[data-close]').addEventListener('click', () => modal.close());
+      dlg.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => modal.close()));
       if (!dlg.open) dlg.showModal();
       dlg.querySelector('.modal-body').scrollTop = 0;
       this.el = dlg;
@@ -655,12 +655,225 @@
   // =====================================================================
   const ui = { view: 'today', date: todayKey() };
   const views = {};
+  const actions = {};
 
   function placeholder(name) {
     return (root) => { root.innerHTML = `<div class="card"><h2>${esc(name)}</h2><p class="muted">Coming soon.</p></div>`; };
   }
   views.today = placeholder('Today');
-  views.foods = placeholder('Foods');
+
+  // ---------------------------------------------------------------------
+  // Shared nutrition display snippets
+  // ---------------------------------------------------------------------
+  function macHtml(n) {
+    return `<span class="p">P <b>${fmtG(n.protein)}</b> g</span><span class="c">C <b>${fmtG(n.carbs)}</b> g</span><span class="f">F <b>${fmtG(n.fat)}</b> g</span>`;
+  }
+  /** Per-100 g summary; missing values are flagged instead of shown as 0. */
+  function per100Html(p) {
+    const part = (k, label, fmt, unit) => (isNum(p[k])
+      ? `${label}${fmt(p[k])}${unit}`
+      : `<span class="badge missing">${esc(NUTR_LABELS[k])} missing</span>`);
+    return `${part('kcal', '', fmtKcal, ' kcal')} · ${part('protein', 'P ', fmtG, ' g')} · ${part('carbs', 'C ', fmtG, ' g')} · ${part('fat', 'F ', fmtG, ' g')} <span class="muted">per 100 g</span>`;
+  }
+  function sourceBadge(f) {
+    return f.source && f.source !== 'manual' ? ` <span class="badge">${esc(SOURCE_LABELS[f.source])}</span>` : '';
+  }
+
+  // ---------------------------------------------------------------------
+  // Food library
+  // ---------------------------------------------------------------------
+  function getFood(id) { return data.foods.find((f) => f.id === id) || null; }
+
+  function searchFoods(query) {
+    const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const list = data.foods.filter((f) => {
+      const hay = (f.name + ' ' + f.brand).toLowerCase();
+      return tokens.every((t) => hay.includes(t));
+    });
+    return list.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  }
+
+  function upsertFood(food) {
+    const i = data.foods.findIndex((f) => f.id === food.id);
+    food.updatedAt = nowIso();
+    if (i >= 0) data.foods[i] = food;
+    else data.foods.push(food);
+    saveData();
+    return food;
+  }
+
+  async function deleteFood(id) {
+    const f = getFood(id);
+    if (!f) return false;
+    const ok = await confirmAsk(`Delete “${f.name}”?`, 'It will be removed from your library. Days you already logged keep their calories (each entry stores its own snapshot).', 'Delete', true);
+    if (!ok) return false;
+    data.foods = data.foods.filter((x) => x.id !== id);
+    saveData();
+    toast('Food deleted.');
+    return true;
+  }
+
+  function newFoodDraft() {
+    return {
+      id: uid(), name: '', brand: '', source: 'manual', sourceId: null,
+      per100g: { kcal: null, protein: null, carbs: null, fat: null, fiber: null, sugar: null },
+      servings: [], recipe: null, createdAt: nowIso(), updatedAt: nowIso(),
+    };
+  }
+
+  function servingRowHtml(s) {
+    return `<div class="serving-row">
+      <label class="field"><span>Serving name</span><input class="sv-label" value="${esc(s ? s.label : '')}" placeholder="e.g. 1 slice"></label>
+      <label class="field"><span>Grams</span><input class="sv-grams" inputmode="decimal" value="${s ? inputVal(s.grams) : ''}" placeholder="g"></label>
+      <button type="button" class="btn ghost icon sv-remove" aria-label="Remove serving">✕</button>
+    </div>`;
+  }
+
+  /**
+   * Food editor. `food` may be a library food, a new draft, or an online result draft.
+   * opts: { title, saveLabel, notes: [], onSaved(food) }
+   */
+  function openFoodEditor(food, opts = {}) {
+    if (food && food.recipe && typeof openRecipeEditor === 'function') { openRecipeEditor(food); return; }
+    const f = food ? clone(food) : newFoodDraft();
+    const existing = !!getFood(f.id);
+    const missingKeys = existing ? [] : NUTR_KEYS.filter((k) => !isNum(f.per100g[k]) && f.source !== 'manual');
+    const nutrField = (k, required) => {
+      const miss = missingKeys.includes(k);
+      return `<label class="field"><span>${NUTR_LABELS[k]}${k === 'kcal' ? ' (kcal)' : ' (g)'}${required ? ' *' : ''}</span>
+        <input id="fe-${k}" inputmode="decimal" value="${inputVal(f.per100g[k])}" class="${miss ? 'missing' : ''}" ${miss ? 'placeholder="Missing — enter value"' : ''}>
+        ${miss ? '<span class="hint" style="color:var(--danger)">Not provided by the source</span>' : ''}</label>`;
+    };
+    const notes = (opts.notes || []).slice();
+    if (missingKeys.length) notes.unshift(`This result is missing ${missingKeys.map((k) => NUTR_LABELS[k].toLowerCase()).join(', ')}. Fill in the value from the label before saving — missing values are never treated as 0.`);
+
+    const body = `
+      ${notes.length ? `<div class="msg warn"><ul>${notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul></div>` : ''}
+      ${f.source !== 'manual' ? `<p class="small muted">Source: ${esc(SOURCE_LABELS[f.source])}${f.sourceId ? ` (${esc(f.sourceId)})` : ''}. Values remain editable.</p>` : ''}
+      <label class="field"><span>Name *</span><input id="fe-name" value="${esc(f.name)}" autocomplete="off"></label>
+      <label class="field"><span>Brand</span><input id="fe-brand" value="${esc(f.brand)}" autocomplete="off"></label>
+      <h3>Nutrition per 100 g</h3>
+      <div class="grid-4">${NUTR_KEYS.map((k) => nutrField(k, true)).join('')}</div>
+      <div class="grid-2">${nutrField('fiber', false)}${nutrField('sugar', false)}</div>
+      <div id="fe-checks"></div>
+      <h3>Serving sizes</h3>
+      <p class="small muted">Named portions with their weight, e.g. “1 slice” = 28 g or “1 cup” = 240 g.</p>
+      <div id="fe-servings">${f.servings.map(servingRowHtml).join('')}</div>
+      <button type="button" class="btn small" id="fe-add-serving">+ Add serving size</button>
+      <div id="fe-errors"></div>`;
+    const foot = `${existing ? '<button type="button" class="btn danger" id="fe-delete">Delete</button><span class="grow"></span>' : ''}
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="button" class="btn primary" id="fe-save">${esc(opts.saveLabel || 'Save food')}</button>`;
+    const dlg = modal.open(opts.title || (existing ? 'Edit food' : 'New food'), body, foot);
+
+    const readPer100 = () => {
+      const p = {};
+      FOOD_NUTR_KEYS.forEach((k) => { p[k] = readNum(dlg.querySelector('#fe-' + k)); });
+      return p;
+    };
+    const showChecks = () => {
+      const p = readPer100();
+      const filled = NUTR_KEYS.every((k) => p[k] !== null);
+      const { errors, warnings } = checkPer100g(p);
+      const box = dlg.querySelector('#fe-checks');
+      // Only surface errors once the user has filled the required fields, to avoid noise while typing.
+      const shownErrors = filled ? errors : errors.filter((e) => !/required/.test(e));
+      box.innerHTML = (shownErrors.length ? `<div class="msg error"><ul>${shownErrors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>` : '') +
+        (warnings.length ? `<div class="msg warn"><b>Check these values:</b><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : '');
+    };
+    dlg.querySelector('.modal-body').addEventListener('input', (ev) => {
+      if (ev.target.id && ev.target.id.startsWith('fe-')) {
+        ev.target.classList.remove('invalid');
+        if (ev.target.classList.contains('missing') && ev.target.value.trim()) ev.target.classList.remove('missing');
+        showChecks();
+      }
+    });
+    dlg.querySelector('#fe-add-serving').addEventListener('click', () => {
+      dlg.querySelector('#fe-servings').insertAdjacentHTML('beforeend', servingRowHtml(null));
+      const rows = dlg.querySelectorAll('.serving-row');
+      rows[rows.length - 1].querySelector('.sv-label').focus();
+    });
+    dlg.querySelector('#fe-servings').addEventListener('click', (ev) => {
+      const rm = ev.target.closest('.sv-remove');
+      if (rm) rm.closest('.serving-row').remove();
+    });
+    const del = dlg.querySelector('#fe-delete');
+    if (del) del.addEventListener('click', async () => {
+      if (await deleteFood(f.id)) { modal.close(); render(); }
+    });
+    dlg.querySelector('#fe-save').addEventListener('click', () => {
+      const errors = [];
+      const nameEl = dlg.querySelector('#fe-name');
+      const name = nameEl.value.trim();
+      nameEl.classList.toggle('invalid', !name);
+      if (!name) errors.push('Name is required.');
+      const p = readPer100();
+      FOOD_NUTR_KEYS.forEach((k) => {
+        const el = dlg.querySelector('#fe-' + k);
+        const required = NUTR_KEYS.includes(k);
+        el.classList.toggle('invalid', Number.isNaN(p[k]) || (isNum(p[k]) && p[k] < 0) || (required && p[k] === null));
+      });
+      errors.push(...checkPer100g(p).errors);
+      const servings = [];
+      dlg.querySelectorAll('.serving-row').forEach((row, i) => {
+        const lEl = row.querySelector('.sv-label');
+        const gEl = row.querySelector('.sv-grams');
+        const label = lEl.value.trim();
+        const grams = readNum(gEl);
+        if (!label && grams === null) return; // blank row: ignore
+        let bad = false;
+        if (!label) { errors.push(`Serving #${i + 1} needs a name.`); lEl.classList.add('invalid'); bad = true; }
+        if (!isNum(grams) || grams <= 0) { errors.push(`Serving #${i + 1} needs a gram weight greater than 0.`); gEl.classList.add('invalid'); bad = true; }
+        if (!bad) servings.push({ label, grams });
+      });
+      const box = dlg.querySelector('#fe-errors');
+      if (errors.length) {
+        box.innerHTML = `<div class="msg error"><b>Can't save yet:</b><ul>${errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>`;
+        box.scrollIntoView({ block: 'nearest' });
+        return;
+      }
+      f.name = name;
+      f.brand = dlg.querySelector('#fe-brand').value.trim();
+      f.per100g = p;
+      f.servings = servings;
+      const saved = upsertFood(f);
+      if (opts.onSaved) opts.onSaved(saved);
+      else { modal.close(); toast(existing ? 'Food updated.' : 'Food saved to library.'); render(); }
+    });
+    showChecks();
+    if (!existing && !f.name) dlg.querySelector('#fe-name').focus();
+  }
+
+  function foodListItemHtml(f) {
+    const extra = f.servings.length ? ` · ${f.servings.length} serving size${f.servings.length > 1 ? 's' : ''}` : '';
+    return `<li><button type="button" class="list-item" data-action="edit-food" data-id="${esc(f.id)}">
+      <div class="title">${esc(f.name)}${sourceBadge(f)}</div>
+      <div class="sub">${f.brand ? esc(f.brand) + ' · ' : ''}${per100Html(f.per100g)}${extra}</div>
+    </button></li>`;
+  }
+
+  ui.foodQuery = '';
+  views.foods = function (root) {
+    root.innerHTML = `<div class="card">
+        <div class="card-head"><h2>My foods</h2><span class="muted small">${data.foods.length} saved</span></div>
+        <div class="searchbar"><input type="search" id="food-search" placeholder="Search my foods" value="${esc(ui.foodQuery)}" autocomplete="off" aria-label="Search my foods"></div>
+        <div class="row" id="food-tools">
+          <button type="button" class="btn primary" data-action="new-food">+ New food</button>
+        </div>
+      </div>
+      <div id="food-list"></div>`;
+    const listEl = root.querySelector('#food-list');
+    const draw = () => {
+      const list = searchFoods(ui.foodQuery);
+      listEl.innerHTML = list.length
+        ? `<ul class="list">${list.map(foodListItemHtml).join('')}</ul>`
+        : `<div class="card list-empty">${data.foods.length ? 'No foods match your search.' : 'Your library is empty. Add foods manually, or find them online when logging.'}</div>`;
+    };
+    root.querySelector('#food-search').addEventListener('input', (ev) => { ui.foodQuery = ev.target.value; draw(); });
+    draw();
+  };
+  actions['new-food'] = () => openFoodEditor(null);
+  actions['edit-food'] = (ds) => { const f = getFood(ds.id); if (f) openFoodEditor(f); };
   views.weight = placeholder('Weight');
   views.history = placeholder('History');
 
@@ -977,7 +1190,7 @@
   // =====================================================================
   // Global actions (event delegation on data-action)
   // =====================================================================
-  const actions = {
+  Object.assign(actions, {
     'export-json': exportJson,
     'export-csv': exportCsv,
     'erase-all': async () => {
@@ -988,7 +1201,7 @@
       toast('All data erased.');
       render();
     },
-  };
+  });
 
   document.addEventListener('click', (ev) => {
     const nav = ev.target.closest('[data-nav]');
