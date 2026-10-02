@@ -1537,7 +1537,179 @@
       if (e) openPortion({ src: { foodId: e.foodId, name: e.name, brand: e.brand, per100g: e.per100g, servings: e.servings }, date: ui.date, entry: e });
     },
   });
-  views.weight = placeholder('Weight');
+  // ---------------------------------------------------------------------
+  // Weight tracking
+  // ---------------------------------------------------------------------
+  /** 7-day moving average: mean of entries dated within [d−6, d] (calendar days), per entry. */
+  function weightSeries() {
+    const w = data.weights;
+    return w.map((e, i) => {
+      const start = addDays(e.date, -6);
+      let sum = 0;
+      let n = 0;
+      for (let j = i; j >= 0 && w[j].date >= start; j--) { sum += w[j].kg; n++; }
+      return { date: e.date, kg: e.kg, ma: sum / n, maCount: n };
+    });
+  }
+  /** The latest entry dated on or before `k`. */
+  function weightOnOrBefore(k) {
+    let found = null;
+    for (const e of data.weights) { if (e.date <= k) found = e; else break; }
+    return found;
+  }
+
+  function niceTicks(min, max, count) {
+    const span = max - min || 1;
+    const raw = span / count;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || raw;
+    const ticks = [];
+    for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+    return ticks;
+  }
+
+  /** Chart width in CSS px so SVG text renders at its real size on phones. */
+  function chartWidth(root) { return Math.max(280, Math.min(720, (root.clientWidth || 640) - 34)); }
+
+  function weightChartSvg(series, W) {
+    const H = W < 480 ? 210 : 250, L = 40, R = 10, T = 12, B = 28;
+    const pts = series.map((s) => ({ date: s.date, x: daysBetween(series[0].date, s.date), y: kgToDisplay(s.kg), ma: kgToDisplay(s.ma), n: s.maCount }));
+    const xMax = Math.max(1, pts[pts.length - 1].x);
+    let yMin = Math.min(...pts.map((p) => Math.min(p.y, p.ma)));
+    let yMax = Math.max(...pts.map((p) => Math.max(p.y, p.ma)));
+    const pad = Math.max(0.5, (yMax - yMin) * 0.12);
+    yMin -= pad; yMax += pad;
+    const sx = (x) => L + (pts.length === 1 ? (W - L - R) / 2 : (x / xMax) * (W - L - R));
+    const sy = (y) => T + (1 - (y - yMin) / (yMax - yMin)) * (H - T - B);
+    const unit = weightUnit();
+    let g = '';
+    niceTicks(yMin, yMax, 4).forEach((v) => {
+      g += `<line class="grid" x1="${L}" x2="${W - R}" y1="${sy(v)}" y2="${sy(v)}"/><text x="${L - 6}" y="${sy(v) + 4}" text-anchor="end">${fmtQty(v)}</text>`;
+    });
+    const xl = pts.length > 2 ? [pts[0], pts[Math.floor((pts.length - 1) / 2)], pts[pts.length - 1]] : pts.length > 1 ? [pts[0], pts[pts.length - 1]] : [pts[0]];
+    [...new Set(xl)].forEach((p, i, arr) => {
+      const anchor = arr.length > 1 && i === 0 ? 'start' : arr.length > 1 && i === arr.length - 1 ? 'end' : 'middle';
+      g += `<text x="${sx(p.x)}" y="${H - 8}" text-anchor="${anchor}">${esc(fmtDate(p.date, { month: 'short', day: 'numeric' }))}</text>`;
+    });
+    const line = (key) => pts.map((p, i) => `${i ? 'L' : 'M'}${sx(p.x).toFixed(1)},${sy(p[key]).toFixed(1)}`).join('');
+    if (pts.length > 1) g += `<path class="raw-line" d="${line('y')}"/><path class="ma" d="${line('ma')}"/>`;
+    pts.forEach((p) => {
+      g += `<g><title>${esc(fmtDate(p.date))}: ${fmtG(p.y)} ${unit} · 7-day avg ${fmtG(p.ma)} ${unit} (${p.n} entr${p.n === 1 ? 'y' : 'ies'})</title>
+        <circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="12" fill="transparent"/>
+        <circle class="raw" cx="${sx(p.x)}" cy="${sy(p.y)}" r="4"/></g>`;
+    });
+    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Weight chart with 7-day moving average">${g}</svg>`;
+  }
+
+  ui.weightRange = 90;
+  views.weight = function (root) {
+    const unit = weightUnit();
+    const all = weightSeries();
+    const latest = all[all.length - 1];
+    const change = (ref) => (latest && ref ? fmtSigned(kgToDisplay(latest.kg) - kgToDisplay(ref.kg), fmtG) + ' ' + unit : '—');
+    const first = data.weights[0];
+    const ago7 = latest && weightOnOrBefore(addDays(latest.date, -7));
+    const ago30 = latest && weightOnOrBefore(addDays(latest.date, -30));
+    const shown = ui.weightRange && latest ? all.filter((s) => s.date > addDays(latest.date, -ui.weightRange)) : all;
+    root.innerHTML = `
+      <form class="card" id="weight-form" novalidate>
+        <h2>Log weight</h2>
+        <div class="grid-2">
+          <label class="field"><span>Date</span><input type="date" id="w-date" value="${todayKey()}" max="${todayKey()}"></label>
+          <label class="field"><span>Weight (${unit})</span><input id="w-kg" inputmode="decimal" autocomplete="off" placeholder="${latest ? fmtG(kgToDisplay(latest.kg)) : ''}"></label>
+        </div>
+        <div id="w-error"></div>
+        <div class="row end"><button type="submit" class="btn primary">Save weight</button></div>
+      </form>
+      <div class="card">
+        <h2>Progress</h2>
+        <div class="stats">
+          <div class="stat"><span class="label">Latest${latest ? ' · ' + esc(fmtDate(latest.date, { month: 'short', day: 'numeric' })) : ''}</span><strong>${latest ? fmtWeight(latest.kg) : '—'}</strong></div>
+          <div class="stat"><span class="label">Since first entry${first ? ' (' + esc(fmtDate(first.date, { month: 'short', day: 'numeric' })) + ')' : ''}</span><strong>${change(first)}</strong></div>
+          <div class="stat"><span class="label">vs. 7 days ago${ago7 ? ' (' + esc(fmtDate(ago7.date, { month: 'short', day: 'numeric' })) + ')' : ''}</span><strong>${change(ago7)}</strong></div>
+          <div class="stat"><span class="label">vs. 30 days ago${ago30 ? ' (' + esc(fmtDate(ago30.date, { month: 'short', day: 'numeric' })) + ')' : ''}</span><strong>${change(ago30)}</strong></div>
+        </div>
+        <p class="small muted">“7/30 days ago” compares with the most recent entry on or before that date.</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Trend</h2>
+          <select id="w-range" aria-label="Chart range" style="width:auto">
+            ${[[30, 'Last 30 days'], [90, 'Last 90 days'], [365, 'Last year'], [0, 'All time']].map(([v, l]) =>
+              `<option value="${v}" ${ui.weightRange === v ? 'selected' : ''}>${l}</option>`).join('')}
+          </select></div>
+        ${shown.length ? weightChartSvg(shown, chartWidth(root)) + `<div class="legend"><span><i style="background:var(--accent)"></i>Daily weight</span><span><i style="background:var(--warn)"></i>7-day moving average</span></div>`
+          : '<p class="muted">Log your weight to see the trend.</p>'}
+      </div>
+      <div class="card">
+        <h2>Entries</h2>
+        ${all.length ? `<div class="weight-list table-wrap"><table class="data">
+          <thead><tr><th>Date</th><th>Weight (${unit})</th><th>7-day avg</th><th><span class="sr-only">Delete</span></th></tr></thead>
+          <tbody>${all.slice().reverse().map((s) => `<tr><td>${esc(fmtDate(s.date))}</td><td>${fmtG(kgToDisplay(s.kg))}</td><td>${fmtG(kgToDisplay(s.ma))}</td>
+            <td><button type="button" class="btn ghost small" data-action="delete-weight" data-date="${s.date}" aria-label="Delete ${esc(fmtDate(s.date))}">✕</button></td></tr>`).join('')}</tbody>
+        </table></div>` : '<p class="muted">No entries yet.</p>'}
+      </div>`;
+
+    root.querySelector('#w-range').addEventListener('change', (ev) => { ui.weightRange = Number(ev.target.value); render(); });
+    root.querySelector('#weight-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const date = root.querySelector('#w-date').value;
+      const wEl = root.querySelector('#w-kg');
+      const v = readNum(wEl);
+      const err = root.querySelector('#w-error');
+      let msg = '';
+      if (!isDateKey(date)) msg = 'Pick a valid date.';
+      else if (v === null) msg = 'Enter your weight.';
+      else if (!isNum(v) || v <= 0) msg = 'Weight must be a number greater than 0.';
+      else if (displayToKg(v) > 700) msg = 'That weight looks too large.';
+      if (msg) { wEl.classList.add('invalid'); err.innerHTML = `<p class="msg error">${esc(msg)}</p>`; return; }
+      await logWeight(date, displayToKg(v));
+      render();
+    });
+  };
+
+  async function logWeight(date, kg) {
+    const existing = data.weights.find((w) => w.date === date);
+    if (existing) {
+      const ok = await confirmAsk('Replace entry?', `You already logged ${fmtWeight(existing.kg)} on ${fmtDate(date)}. Replace it with ${fmtWeight(kg)}?`, 'Replace');
+      if (!ok) return;
+      existing.kg = kg;
+    } else {
+      data.weights.push({ date, kg });
+      data.weights.sort((a, b) => (a.date < b.date ? -1 : 1));
+    }
+    saveData();
+    toast('Weight saved.');
+
+    // Offer to recalculate the target when this is the newest weigh-in.
+    const s = data.settings;
+    const isNewest = data.weights[data.weights.length - 1].date === date;
+    if (!isNewest || s.targetMode !== 'calculated' || (isNum(s.profile.weightKg) && Math.abs(s.profile.weightKg - kg) < 1e-9)) return;
+    const candidate = clone(s);
+    candidate.profile.weightKg = kg;
+    const before = calculatedTarget(s);
+    const after = calculatedTarget(candidate);
+    if (!isNum(after)) return;
+    const ok = await ask({
+      title: 'Recalculate target?',
+      message: `Update your profile weight to ${fmtWeight(kg)} and recalculate your daily target${isNum(before) ? ` (${fmtKcal(before)} → ${fmtKcal(after)} kcal)` : ` (${fmtKcal(after)} kcal)`}?`,
+      buttons: [{ label: 'Not now', value: false }, { label: 'Update target', value: true, kind: 'primary' }],
+    });
+    if (ok) {
+      s.profile.weightKg = kg;
+      syncTargetHistory();
+      saveData();
+      toast(`Target updated to ${fmtKcal(after)} kcal.`);
+    }
+  }
+
+  actions['delete-weight'] = async (ds) => {
+    const w = data.weights.find((x) => x.date === ds.date);
+    if (!w) return;
+    if (!(await confirmAsk('Delete weight entry?', `Delete ${fmtWeight(w.kg)} on ${fmtDate(w.date)}?`, 'Delete', true))) return;
+    data.weights = data.weights.filter((x) => x.date !== ds.date);
+    saveData();
+    render();
+  };
   views.history = placeholder('History');
 
   // ---------------------------------------------------------------------
