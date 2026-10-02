@@ -660,8 +660,6 @@
   function placeholder(name) {
     return (root) => { root.innerHTML = `<div class="card"><h2>${esc(name)}</h2><p class="muted">Coming soon.</p></div>`; };
   }
-  views.today = placeholder('Today');
-
   // ---------------------------------------------------------------------
   // Shared nutrition display snippets
   // ---------------------------------------------------------------------
@@ -874,6 +872,416 @@
   };
   actions['new-food'] = () => openFoodEditor(null);
   actions['edit-food'] = (ds) => { const f = getFood(ds.id); if (f) openFoodEditor(f); };
+
+  // ---------------------------------------------------------------------
+  // Log entries
+  // ---------------------------------------------------------------------
+  const mealLabel = (k) => (MEALS.find((m) => m.key === k) || MEALS[3]).label;
+  function entriesFor(k) { return data.logs[k] || []; }
+  function dayTotals(k) { return sumNutrition(entriesFor(k).map((e) => e.nutrition)); }
+
+  function unitOptions(servings) {
+    return [{ key: 'g', label: 'g', grams: 1 }, { key: 'oz', label: 'oz', grams: G_PER_OZ }]
+      .concat((servings || []).map((s, i) => ({ key: 's' + i, label: s.label, grams: s.grams })));
+  }
+  function amountText(e) {
+    if (e.unitLabel === 'g') return `${fmtQty(e.grams)} g`;
+    if (e.unitLabel === 'oz') return `${fmtQty(e.unitQty)} oz (${fmtQty(e.grams)} g)`;
+    return `${fmtQty(e.unitQty)} × ${e.unitLabel} (${fmtQty(e.grams)} g)`;
+  }
+  function guessMeal() {
+    const h = new Date().getHours() + new Date().getMinutes() / 60;
+    if (h < 10.5) return 'breakfast';
+    if (h < 15) return 'lunch';
+    if (h < 21) return 'dinner';
+    return 'snacks';
+  }
+  /** What gets snapshotted into an entry: identity, per-100 g core nutrition and servings. */
+  function foodSource(f) {
+    return { foodId: f.id, name: f.name, brand: f.brand, per100g: normNutr(f.per100g, NUTR_KEYS), servings: clone(f.servings) };
+  }
+  function makeEntry(src, grams, unitLabel, unitQty, meal) {
+    return {
+      id: uid(), meal, foodId: src.foodId || null, name: src.name, brand: src.brand || '',
+      grams, unitLabel, unitQty,
+      per100g: clone(src.per100g), servings: clone(src.servings || []),
+      nutrition: scaleNutrition(src.per100g, grams),
+      createdAt: nowIso(),
+    };
+  }
+  function addEntry(k, entry) {
+    (data.logs[k] || (data.logs[k] = [])).push(entry);
+    saveData();
+  }
+  function findEntry(k, id) { return entriesFor(k).find((e) => e.id === id) || null; }
+  function removeEntry(k, id) {
+    if (!data.logs[k]) return;
+    data.logs[k] = data.logs[k].filter((e) => e.id !== id);
+    if (!data.logs[k].length) delete data.logs[k];
+    saveData();
+  }
+
+  /** Most recently logged distinct foods, newest first. */
+  function recentEntries() {
+    const all = [];
+    Object.keys(data.logs).forEach((k) => data.logs[k].forEach((e) => all.push(e)));
+    all.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    const seen = new Set();
+    const out = [];
+    for (const e of all) {
+      const key = e.foodId && getFood(e.foodId) ? 'id:' + e.foodId : 'n:' + e.name + '|' + e.brand;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(e);
+      if (out.length >= RECENT_LIMIT) break;
+    }
+    return out;
+  }
+  /** Re-add source for a recent entry: current library values when the food still exists, else the snapshot. */
+  function recentSource(e) {
+    const f = e.foodId && getFood(e.foodId);
+    return f ? foodSource(f) : { foodId: e.foodId, name: e.name, brand: e.brand, per100g: clone(e.per100g), servings: clone(e.servings) };
+  }
+  /** Resolve a previous amount against a (possibly updated) source: same unit and quantity. */
+  function resolveAmount(src, unitLabel, unitQty, grams) {
+    const opt = unitOptions(src.servings).find((o) => o.label === unitLabel);
+    if (opt) return { unit: opt, qty: unitQty, grams: unitQty * opt.grams };
+    return { unit: unitOptions([])[0], qty: grams, grams };
+  }
+  function quickReAdd(e, meal, k) {
+    const src = recentSource(e);
+    if (NUTR_KEYS.some((n) => !isNum(src.per100g[n]))) { toast('This food has incomplete nutrition. Edit it first.'); return; }
+    const a = resolveAmount(src, e.unitLabel, e.unitQty, e.grams);
+    addEntry(k, makeEntry(src, a.grams, a.unit.label, a.qty, meal));
+    toast(`Added ${src.name} (${amountText({ grams: a.grams, unitLabel: a.unit.label, unitQty: a.qty })}) to ${mealLabel(meal)}.`);
+  }
+
+  // ---------------------------------------------------------------------
+  // Portion entry (amount → grams, live preview)
+  // ---------------------------------------------------------------------
+  /**
+   * opts: { src, date, meal, entry (when editing), preset: {unitLabel, unitQty, grams}, onBack }
+   */
+  function openPortion(opts) {
+    const { src, date } = opts;
+    const editing = opts.entry || null;
+    const options = unitOptions(src.servings);
+    let unit = options[0];
+    let qty = 100;
+    const preset = editing || opts.preset;
+    if (preset) {
+      const a = resolveAmount(src, preset.unitLabel, preset.unitQty, preset.grams);
+      unit = a.unit; qty = a.qty;
+    } else if (options.length > 2) {
+      unit = options[2]; qty = 1;
+    }
+    const meal = editing ? editing.meal : opts.meal || guessMeal();
+    const body = `
+      <div>
+        <div class="title"><b>${esc(src.name)}</b>${src.brand ? ` <span class="muted">· ${esc(src.brand)}</span>` : ''}</div>
+        <div class="small muted">${per100Html(src.per100g)}</div>
+        ${editing ? '<p class="small muted">Uses the nutrition saved when this entry was logged, so library edits never change past days.</p>' : ''}
+      </div>
+      <div class="grid-2">
+        <label class="field"><span>Amount</span><input id="pt-qty" inputmode="decimal" value="${inputVal(qty)}" autocomplete="off"></label>
+        <label class="field"><span>Unit</span><select id="pt-unit">${options.map((o) =>
+          `<option value="${o.key}" ${o.key === unit.key ? 'selected' : ''}>${esc(o.key === 'g' ? 'grams (g)' : o.key === 'oz' ? 'ounces (oz)' : `${o.label} (${fmtQty(o.grams)} g)`)}</option>`).join('')}</select></label>
+      </div>
+      <label class="field"><span>Meal</span><select id="pt-meal">${MEALS.map((m) =>
+        `<option value="${m.key}" ${m.key === meal ? 'selected' : ''}>${m.label}</option>`).join('')}</select></label>
+      <div class="preview" id="pt-preview" aria-live="polite"></div>`;
+    const foot = `${editing ? '<button type="button" class="btn danger" id="pt-delete">Delete</button><span class="grow"></span>' : ''}
+      ${opts.onBack ? '<button type="button" class="btn" id="pt-back">Back</button>' : '<button type="button" class="btn" data-close>Cancel</button>'}
+      <button type="button" class="btn primary" id="pt-save">${editing ? 'Save' : 'Add'}</button>`;
+    const dlg = modal.open(editing ? 'Edit entry' : 'Add to log', body, foot);
+    const qtyEl = dlg.querySelector('#pt-qty');
+    const unitEl = dlg.querySelector('#pt-unit');
+
+    const compute = () => {
+      const q = readNum(qtyEl);
+      const u = options.find((o) => o.key === unitEl.value);
+      if (!isNum(q) || q <= 0) return { error: q === null ? 'Enter an amount.' : 'Amount must be a number greater than 0.' };
+      const grams = q * u.grams;
+      return { q, u, grams, n: scaleNutrition(src.per100g, grams) };
+    };
+    const preview = () => {
+      const r = compute();
+      const box = dlg.querySelector('#pt-preview');
+      qtyEl.classList.toggle('invalid', !!r.error && qtyEl.value.trim() !== '');
+      if (r.error) { box.innerHTML = `<span class="muted">${esc(r.error)}</span>`; return; }
+      const gramsLine = r.u.key === 'g' ? `${fmtQty(r.grams)} g` : `${fmtQty(r.q)} × ${esc(r.u.key === 'oz' ? '1 oz' : r.u.label)} = <b>${fmtQty(r.grams)} g</b>`;
+      box.innerHTML = `<div class="small muted">${gramsLine}</div>
+        <div><span class="big">${fmtKcal(r.n.kcal)}</span> kcal</div>
+        <div class="mac">${macHtml(r.n)}</div>`;
+    };
+    qtyEl.addEventListener('input', preview);
+    unitEl.addEventListener('change', preview);
+    preview();
+    qtyEl.focus();
+    qtyEl.select();
+
+    const save = () => {
+      const r = compute();
+      if (r.error) { qtyEl.classList.add('invalid'); qtyEl.focus(); return; }
+      const m = dlg.querySelector('#pt-meal').value;
+      if (editing) {
+        const e = findEntry(date, editing.id);
+        if (!e) { modal.close(); render(); return; }
+        e.grams = r.grams;
+        e.unitLabel = r.u.label;
+        e.unitQty = r.q;
+        e.meal = m;
+        e.nutrition = scaleNutrition(e.per100g, r.grams);
+        saveData();
+        toast('Entry updated.');
+      } else {
+        addEntry(date, makeEntry(src, r.grams, r.u.label, r.q, m));
+        toast(`Added to ${mealLabel(m)}.`);
+      }
+      modal.close();
+      render();
+    };
+    dlg.querySelector('#pt-save').addEventListener('click', save);
+    qtyEl.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); save(); } });
+    const back = dlg.querySelector('#pt-back');
+    if (back) back.addEventListener('click', () => opts.onBack(dlg.querySelector('#pt-meal').value));
+    const del = dlg.querySelector('#pt-delete');
+    if (del) del.addEventListener('click', async () => {
+      if (!(await confirmAsk('Delete entry?', `Remove ${editing.name} (${amountText(editing)}) from ${mealLabel(editing.meal)}?`, 'Delete', true))) return;
+      removeEntry(date, editing.id);
+      modal.close();
+      toast('Entry deleted.');
+      render();
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // Add-food flow: search library, recents and online sources
+  // ---------------------------------------------------------------------
+  const addState = { query: '', meal: 'breakfast', date: null, online: null };
+
+  function openAddFood(meal) {
+    addState.meal = meal || (ui.date === todayKey() ? guessMeal() : 'breakfast');
+    addState.date = ui.date;
+    addState.query = '';
+    addState.online = null;
+    drawAddFood();
+  }
+
+  function recentRowHtml(e) {
+    const src = recentSource(e);
+    const a = resolveAmount(src, e.unitLabel, e.unitQty, e.grams);
+    const n = scaleNutrition(src.per100g, a.grams);
+    const amt = amountText({ grams: a.grams, unitLabel: a.unit.label, unitQty: a.qty });
+    return `<li class="list-row">
+      <button type="button" class="list-item" data-recent="${esc(e.id)}">
+        <div class="title">${esc(e.name)}</div>
+        <div class="sub">${esc(amt)} · ${fmtKcal(n.kcal)} kcal</div>
+      </button>
+      <button type="button" class="quick" data-quick="${esc(e.id)}" aria-label="Add ${esc(e.name)}, ${esc(amt)}">+</button>
+    </li>`;
+  }
+  function libraryRowHtml(f) {
+    return `<li><button type="button" class="list-item" data-pick-food="${esc(f.id)}">
+      <div class="title">${esc(f.name)}${sourceBadge(f)}</div>
+      <div class="sub">${f.brand ? esc(f.brand) + ' · ' : ''}${per100Html(f.per100g)}</div>
+    </button></li>`;
+  }
+
+  function addResultsHtml() {
+    const q = addState.query.trim();
+    let html = '';
+    if (!q) {
+      const rec = recentEntries();
+      html += `<div class="section-label">Recent foods</div>` + (rec.length
+        ? `<ul class="list">${rec.map(recentRowHtml).join('')}</ul><p class="small muted">Tap + to re-add the same amount in one tap.</p>`
+        : `<div class="list-empty">Foods you log will show up here for quick re-adding.</div>`);
+      const lib = searchFoods('');
+      if (lib.length) html += `<div class="section-label">My foods</div><ul class="list">${lib.map(libraryRowHtml).join('')}</ul>`;
+    } else {
+      const lib = searchFoods(q);
+      html += `<div class="section-label">My foods</div>` + (lib.length
+        ? `<ul class="list">${lib.map(libraryRowHtml).join('')}</ul>`
+        : `<div class="list-empty">No saved foods match “${esc(q)}”.</div>`);
+    }
+    if (typeof onlineResultsHtml === 'function') html += onlineResultsHtml();
+    return html;
+  }
+
+  function drawAddFood() {
+    const meal = addState.meal;
+    const hasOnline = typeof searchOnline === 'function';
+    const body = `
+      <div class="grid-2">
+        <label class="field"><span>Meal</span><select id="af-meal">${MEALS.map((m) =>
+          `<option value="${m.key}" ${m.key === meal ? 'selected' : ''}>${m.label}</option>`).join('')}</select></label>
+        <div class="field"><span>Day</span><div style="min-height:44px;display:flex;align-items:center"><b>${esc(fmtDate(addState.date, { weekday: 'short', month: 'short', day: 'numeric' }))}</b></div></div>
+      </div>
+      <form class="searchbar" id="af-form" role="search">
+        <input type="search" id="af-q" placeholder="${hasOnline ? 'Search foods or enter a barcode' : 'Search my foods'}" value="${esc(addState.query)}" autocomplete="off" aria-label="Search foods">
+        ${hasOnline ? '<button type="submit" class="btn primary">Search online</button>' : ''}
+      </form>
+      <div id="af-results">${addResultsHtml()}</div>`;
+    const foot = `<button type="button" class="btn" id="af-manual">+ Create food manually</button>`;
+    const dlg = modal.open('Add food', body, foot);
+    bindAddFood(dlg);
+  }
+
+  function refreshAddResults() {
+    const box = document.querySelector('#af-results');
+    if (box) box.innerHTML = addResultsHtml();
+  }
+
+  function bindAddFood(dlg) {
+    const qEl = dlg.querySelector('#af-q');
+    dlg.querySelector('#af-meal').addEventListener('change', (ev) => { addState.meal = ev.target.value; });
+    qEl.addEventListener('input', () => { addState.query = qEl.value; addState.online = null; refreshAddResults(); });
+    dlg.querySelector('#af-form').addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      addState.query = qEl.value;
+      if (typeof searchOnline === 'function' && addState.query.trim()) searchOnline(addState.query.trim());
+    });
+    const backToSearch = (m) => { if (m) addState.meal = m; drawAddFood(); };
+    dlg.querySelector('#af-results').addEventListener('click', (ev) => {
+      const quick = ev.target.closest('[data-quick]');
+      if (quick) {
+        const e = recentEntries().find((x) => x.id === quick.dataset.quick);
+        if (e) { quickReAdd(e, addState.meal, addState.date); modal.close(); render(); }
+        return;
+      }
+      const rec = ev.target.closest('[data-recent]');
+      if (rec) {
+        const e = recentEntries().find((x) => x.id === rec.dataset.recent);
+        if (e) openPortion({ src: recentSource(e), date: addState.date, meal: addState.meal, preset: e, onBack: backToSearch });
+        return;
+      }
+      const pick = ev.target.closest('[data-pick-food]');
+      if (pick) {
+        const f = getFood(pick.dataset.pickFood);
+        if (f) openPortion({ src: foodSource(f), date: addState.date, meal: addState.meal, onBack: backToSearch });
+        return;
+      }
+      if (typeof handleOnlineClick === 'function') handleOnlineClick(ev, backToSearch);
+    });
+    dlg.querySelector('#af-manual').addEventListener('click', () => {
+      const draft = newFoodDraft();
+      draft.name = addState.query.trim();
+      openFoodEditor(draft, {
+        saveLabel: 'Save & continue',
+        onSaved: (f) => openPortion({ src: foodSource(f), date: addState.date, meal: addState.meal, onBack: backToSearch }),
+      });
+    });
+    qEl.focus();
+  }
+
+  // ---------------------------------------------------------------------
+  // Today view
+  // ---------------------------------------------------------------------
+  function budgetHtml(k) {
+    const target = targetForDate(k);
+    const eaten = dayTotals(k);
+    let top;
+    if (isNum(target)) {
+      const remaining = target - eaten.kcal;
+      const over = remaining < 0;
+      const pct = target > 0 ? Math.min(100, (eaten.kcal / target) * 100) : 100;
+      top = `<div class="budget-nums">
+          <div><span class="label">Target</span><strong>${fmtKcal(target)}</strong></div>
+          <div><span class="label">Eaten</span><strong>${fmtKcal(eaten.kcal)}</strong></div>
+          <div class="${over ? 'over' : 'under'}"><span class="label">${over ? 'Over' : 'Remaining'}</span><strong>${fmtKcal(Math.abs(remaining))}</strong></div>
+        </div>
+        <div class="bar ${over ? 'over' : ''}" role="progressbar" aria-label="Calories eaten" aria-valuemin="0" aria-valuemax="${Math.round(target)}" aria-valuenow="${Math.round(eaten.kcal)}"><div style="width:${pct}%"></div></div>`;
+    } else {
+      top = `<div class="budget-nums">
+          <div><span class="label">Target</span><strong>—</strong></div>
+          <div><span class="label">Eaten</span><strong>${fmtKcal(eaten.kcal)}</strong></div>
+          <div><span class="label">Remaining</span><strong>—</strong></div>
+        </div>
+        <p class="small muted">No calorie target yet. <a href="#settings">Set one up in Settings.</a></p>`;
+    }
+    const mt = data.settings.macroTargets;
+    const macro = (key, label) => {
+      const t = mt[key];
+      const v = eaten[key];
+      const has = isNum(t) && t > 0;
+      const over = has && v > t;
+      return `<div class="macro ${key}">
+        <div class="macro-label"><b>${label}</b><span class="num">${fmtG(v)}${has ? ` / ${fmtG(t)}` : ''} g</span></div>
+        ${has ? `<div class="bar thin ${over ? 'over' : ''}"><div style="width:${Math.min(100, (v / t) * 100)}%"></div></div>` : ''}
+      </div>`;
+    };
+    return `<div class="card">${top}<div class="macros">${macro('protein', 'Protein')}${macro('carbs', 'Carbs')}${macro('fat', 'Fat')}</div></div>`;
+  }
+
+  function entryHtml(e) {
+    return `<li><button type="button" class="entry" data-action="edit-entry" data-id="${esc(e.id)}">
+      <span><span class="name">${esc(e.name)}</span><br><span class="amount">${esc(amountText(e))}</span></span>
+      <span class="kcal num">${fmtKcal(e.nutrition.kcal)} kcal</span>
+      <span class="mac">${macHtml(e.nutrition)}</span>
+    </button></li>`;
+  }
+
+  function mealToolsHtml(meal) {
+    return typeof copyMealButtonHtml === 'function' ? copyMealButtonHtml(meal) : '';
+  }
+
+  function mealHtml(k, meal) {
+    const list = entriesFor(k).filter((e) => e.meal === meal.key);
+    const sub = sumNutrition(list.map((e) => e.nutrition));
+    return `<section class="card meal" aria-label="${meal.label}">
+      <div class="meal-head">
+        <h2>${meal.label}</h2>
+        <span class="kcal num">${fmtKcal(sub.kcal)} kcal</span>
+        ${mealToolsHtml(meal)}
+        <button type="button" class="btn small primary" data-action="add-food" data-meal="${meal.key}" aria-label="Add food to ${meal.label}">+ Add</button>
+      </div>
+      ${list.length ? `<ul>${list.map(entryHtml).join('')}</ul>
+        <div class="subtotal"><span>${meal.label} subtotal</span><span class="kcal num">${fmtKcal(sub.kcal)} kcal</span><span class="mac">${macHtml(sub)}</span></div>`
+        : `<div class="empty">Nothing logged.</div>`}
+    </section>`;
+  }
+
+  views.today = function (root) {
+    const k = ui.date;
+    const isToday = k === todayKey();
+    const total = dayTotals(k);
+    root.innerHTML = `
+      <div class="daynav">
+        <button type="button" class="btn icon" data-action="day-prev" aria-label="Previous day">‹</button>
+        <label class="datepick">
+          <strong>${esc(relativeDayName(k))}</strong>
+          <span class="small muted">${esc(fmtDate(k))}</span>
+          <input type="date" id="day-input" value="${k}" aria-label="Pick a date">
+        </label>
+        <button type="button" class="btn icon" data-action="day-next" aria-label="Next day">›</button>
+        ${isToday ? '' : '<button type="button" class="btn small" data-action="day-today">Today</button>'}
+      </div>
+      ${budgetHtml(k)}
+      <div class="actions-bar">
+        <button type="button" class="btn primary" data-action="add-food">+ Add food</button>
+        ${typeof copyDayButtonHtml === 'function' ? copyDayButtonHtml() : ''}
+      </div>
+      ${MEALS.map((m) => mealHtml(k, m)).join('')}
+      <div class="card daytotal">
+        <h2>Day total</h2>
+        <span class="kcal num">${fmtKcal(total.kcal)} kcal</span>
+        <span class="mac">${macHtml(total)}</span>
+      </div>`;
+    root.querySelector('#day-input').addEventListener('change', (ev) => {
+      if (isDateKey(ev.target.value)) { ui.date = ev.target.value; render(); }
+    });
+  };
+
+  Object.assign(actions, {
+    'day-prev': () => { ui.date = addDays(ui.date, -1); render(); },
+    'day-next': () => { ui.date = addDays(ui.date, 1); render(); },
+    'day-today': () => { ui.date = todayKey(); render(); },
+    'add-food': (ds) => openAddFood(ds.meal),
+    'edit-entry': (ds) => {
+      const e = findEntry(ui.date, ds.id);
+      if (e) openPortion({ src: { foodId: e.foodId, name: e.name, brand: e.brand, per100g: e.per100g, servings: e.servings }, date: ui.date, entry: e });
+    },
+  });
   views.weight = placeholder('Weight');
   views.history = placeholder('History');
 
@@ -1253,6 +1661,17 @@
     const hash = location.hash.replace('#', '');
     ui.view = views[hash] ? hash : 'today';
     render();
+    // If the app stays open past midnight, follow "today" when the user was viewing it.
+    let lastToday = todayKey();
+    const rollover = () => {
+      const t = todayKey();
+      if (t === lastToday) return;
+      if (ui.date === lastToday) ui.date = t;
+      lastToday = t;
+      render();
+    };
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) rollover(); });
+    setInterval(rollover, 60000);
     window.addEventListener('hashchange', () => {
       const h = location.hash.replace('#', '');
       if (views[h] && h !== ui.view) setView(h);
