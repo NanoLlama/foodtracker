@@ -123,6 +123,18 @@
           { nutrientNumber: '204', unitName: 'G', value: 0.2 }] });
         eq(u.per100g.kcal, 52); eq(u.per100g.protein, 0.3); eq(u.per100g.fat, 0.2); eq(u.per100g.carbs, null);
       });
+      test('Data saved before the g/mL change loads as grams', () => {
+        const d = F.normalize({ schemaVersion: 1, settings: {}, foods: [{ id: 'a', name: 'A', per100g: { kcal: 1, protein: 0, carbs: 0, fat: 0 } }],
+          logs: { '2026-10-02': [{ id: 'e', grams: 10, nutrition: { kcal: 0.1, protein: 0, carbs: 0, fat: 0 } }] }, weights: [] });
+        eq(d.foods[0].unit, 'g');
+        eq(d.logs['2026-10-02'][0].unit, 'g');
+      });
+      test('Open Food Facts: drinks with nutrition per 100 mL stay in mL', () => {
+        const r = F.normalizeOff({ code: '9', product_name: 'Juice', nutrition_data_per: '100ml', serving_quantity: 250, serving_quantity_unit: 'ml', serving_size: '250 ml',
+          nutriments: { 'energy-kcal_100g': 45, proteins_100g: 0.5, carbohydrates_100g: 10, fat_100g: 0 } });
+        eq(r.unit, 'ml');
+        eq(r.servings[0].grams, 250);
+      });
       test('Backup validation rejects malformed files and accepts a valid one', () => {
         if (!F.validateBackup({ foo: 1 }).length) throw new Error('accepted garbage');
         if (!F.validateBackup(Object.assign(F.defaultData(), { schemaVersion: 99 })).length) throw new Error('accepted newer schema');
@@ -130,8 +142,8 @@
       });
       test('normalize() round-trips a valid data object exactly', () => {
         const d = F.defaultData();
-        d.foods.push({ id: 'f', name: 'N', brand: '', source: 'manual', sourceId: null, per100g: { kcal: 1, protein: 0, carbs: 0, fat: 0, fiber: null, sugar: null }, servings: [{ label: '1 x', grams: 5 }], recipe: null, createdAt: 'a', updatedAt: 'b' });
-        d.logs['2026-10-02'] = [{ id: 'e', meal: 'lunch', foodId: 'f', name: 'N', brand: '', grams: 5, unitLabel: '1 x', unitQty: 1, per100g: { kcal: 1, protein: 0, carbs: 0, fat: 0 }, servings: [{ label: '1 x', grams: 5 }], nutrition: { kcal: 0.05, protein: 0, carbs: 0, fat: 0 }, createdAt: 'c' }];
+        d.foods.push({ id: 'f', name: 'N', brand: '', source: 'manual', sourceId: null, unit: 'g', per100g: { kcal: 1, protein: 0, carbs: 0, fat: 0, fiber: null, sugar: null }, servings: [{ label: '1 x', grams: 5 }], recipe: null, createdAt: 'a', updatedAt: 'b' });
+        d.logs['2026-10-02'] = [{ id: 'e', meal: 'lunch', foodId: 'f', name: 'N', brand: '', grams: 5, unit: 'g', unitLabel: '1 x', unitQty: 1, per100g: { kcal: 1, protein: 0, carbs: 0, fat: 0 }, servings: [{ label: '1 x', grams: 5 }], nutrition: { kcal: 0.05, protein: 0, carbs: 0, fat: 0 }, createdAt: 'c' }];
         d.weights.push({ date: '2026-10-01', kg: 80.5 });
         d.targetHistory.push({ from: '2026-10-01', kcal: 1800.25 });
         eq(JSON.stringify(F.normalize(JSON.parse(JSON.stringify(d)))), JSON.stringify(d));

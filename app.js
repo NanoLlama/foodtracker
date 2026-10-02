@@ -1,7 +1,9 @@
 /* Food Tracker — vanilla JS, no build step.
  *
  * Accuracy rules followed throughout:
- *  - Nutrition is stored per 100 g and entry nutrition is per100g × grams / 100.
+ *  - Nutrition is stored per 100 g (or per 100 mL for foods measured by volume) and entry
+ *    nutrition is per100g × amount / 100. The `grams` field of an entry holds the amount in the
+ *    food's base unit (`unit`: 'g' or 'ml'). Foods can be entered per serving; that is converted.
  *  - Raw values are stored unrounded; rounding happens only in fmt* display helpers.
  *  - Totals sum unrounded values and are rounded once, at display time.
  *  - Log entries keep a snapshot of the food's nutrition at logging time.
@@ -15,6 +17,7 @@
   const STORAGE_KEY = 'foodTracker.v1';
   const SCHEMA_VERSION = 1;
   const G_PER_OZ = 28.3495;
+  const ML_PER_FL_OZ = 29.5735; // US fluid ounce
   const KG_PER_LB = 0.45359237;
   const CM_PER_IN = 2.54;
   const KJ_PER_KCAL = 4.184;
@@ -133,12 +136,13 @@
     return out;
   }
 
-  /** Validates a per-100 g nutrition object. Errors block saving; warnings do not. */
-  function checkPer100g(p) {
+  /** Validates a per-100 g (or per-100 mL) nutrition object. Errors block saving; warnings do not. */
+  function checkPer100g(p, unit) {
+    const per = unit === 'ml' ? 'per 100 mL' : 'per 100 g';
     const errors = [];
     const warnings = [];
     NUTR_KEYS.forEach((k) => {
-      if (!isNum(p[k])) errors.push(`${NUTR_LABELS[k]} per 100 g is required.`);
+      if (!isNum(p[k])) errors.push(`${NUTR_LABELS[k]} is required.`);
       else if (p[k] < 0) errors.push(`${NUTR_LABELS[k]} can't be negative.`);
     });
     ['fiber', 'sugar'].forEach((k) => {
@@ -146,9 +150,9 @@
     });
     if (errors.length) return { errors, warnings };
 
-    if (p.kcal > 900) warnings.push(`${fmtKcal(p.kcal)} kcal per 100 g is unusually high (pure fat is ~900). Double-check the value.`);
+    if (p.kcal > 900) warnings.push(`${fmtKcal(p.kcal)} kcal ${per} is unusually high (pure fat is ~900 per 100 g). Double-check the value and serving size.`);
     const macroGrams = p.protein + p.carbs + p.fat;
-    if (macroGrams > 100.5) warnings.push(`Protein + carbs + fat add up to ${fmtG(macroGrams)} g per 100 g, which is more than 100 g.`);
+    if (unit !== 'ml' && macroGrams > 100.5) warnings.push(`Protein + carbs + fat add up to ${fmtG(macroGrams)} g per 100 g, which is more than 100 g. Check the serving size.`);
     if (isNum(p.sugar) && p.sugar > p.carbs + 0.05) warnings.push('Sugar is higher than total carbs.');
     const macroKcal = 4 * p.protein + 4 * p.carbs + 9 * p.fat;
     const diff = Math.abs(macroKcal - p.kcal);
@@ -243,6 +247,7 @@
       brand: str(f.brand),
       source: SOURCES.includes(f.source) ? f.source : 'manual',
       sourceId: f.sourceId == null ? null : String(f.sourceId),
+      unit: f.unit === 'ml' ? 'ml' : 'g',
       per100g: normNutr(f.per100g, FOOD_NUTR_KEYS),
       servings: normServings(f.servings),
       recipe: normRecipe(f.recipe),
@@ -264,6 +269,7 @@
       name: str(e.name, 'Food'),
       brand: str(e.brand),
       grams: e.grams,
+      unit: e.unit === 'ml' ? 'ml' : 'g',
       unitLabel: str(e.unitLabel, 'g'),
       unitQty: isNum(e.unitQty) ? e.unitQty : e.grams,
       per100g,
@@ -506,11 +512,11 @@
   const csvNum = (v) => (isNum(v) ? String(Math.round(v * 10000) / 10000) : '');
 
   function exportCsv() {
-    const rows = [['date', 'meal', 'food', 'brand', 'quantity', 'unit', 'grams', 'kcal', 'protein_g', 'carbs_g', 'fat_g']];
+    const rows = [['date', 'meal', 'food', 'brand', 'quantity', 'unit', 'amount', 'amount_unit', 'kcal', 'protein_g', 'carbs_g', 'fat_g']];
     Object.keys(data.logs).sort().forEach((k) => {
       const entries = data.logs[k].slice().sort((a, b) => MEAL_KEYS.indexOf(a.meal) - MEAL_KEYS.indexOf(b.meal));
       entries.forEach((e) => {
-        rows.push([k, e.meal, e.name, e.brand, csvNum(e.unitQty), e.unitLabel, csvNum(e.grams),
+        rows.push([k, e.meal, e.name, e.brand, csvNum(e.unitQty), e.unitLabel, csvNum(e.grams), e.unit === 'ml' ? 'mL' : 'g',
           csvNum(e.nutrition.kcal), csvNum(e.nutrition.protein), csvNum(e.nutrition.carbs), csvNum(e.nutrition.fat)]);
       });
     });
@@ -663,12 +669,22 @@
   function macHtml(n) {
     return `<span class="p">P <b>${fmtG(n.protein)}</b> g</span><span class="c">C <b>${fmtG(n.carbs)}</b> g</span><span class="f">F <b>${fmtG(n.fat)}</b> g</span>`;
   }
-  /** Per-100 g summary; missing values are flagged instead of shown as 0. */
-  function per100Html(p) {
+  const baseLabel = (unit) => (unit === 'ml' ? 'mL' : 'g');
+  /** Nutrition line; missing values are flagged instead of shown as 0. */
+  function nutrLineHtml(p, perText) {
     const part = (k, label, fmt, unit) => (isNum(p[k])
       ? `${label}${fmt(p[k])}${unit}`
       : `<span class="badge missing">${esc(NUTR_LABELS[k])} missing</span>`);
-    return `${part('kcal', '', fmtKcal, ' kcal')} · ${part('protein', 'P ', fmtG, ' g')} · ${part('carbs', 'C ', fmtG, ' g')} · ${part('fat', 'F ', fmtG, ' g')} <span class="muted">per 100 g</span>`;
+    return `${part('kcal', '', fmtKcal, ' kcal')} · ${part('protein', 'P ', fmtG, ' g')} · ${part('carbs', 'C ', fmtG, ' g')} · ${part('fat', 'F ', fmtG, ' g')} <span class="muted">${esc(perText)}</span>`;
+  }
+  function per100Html(p, unit) { return nutrLineHtml(p, 'per 100 ' + baseLabel(unit)); }
+  /** Shows nutrition for the food's first serving (as on a label) when it has one, else per 100. */
+  function nutritionSummaryHtml(f) {
+    const s = f.servings && f.servings[0];
+    if (!s) return per100Html(f.per100g, f.unit);
+    const scaled = {};
+    NUTR_KEYS.forEach((k) => { scaled[k] = isNum(f.per100g[k]) ? (f.per100g[k] * s.grams) / 100 : null; });
+    return nutrLineHtml(scaled, `per ${s.label} (${fmtQty(s.grams)} ${baseLabel(f.unit)})`);
   }
   function sourceBadge(f) {
     return f.source && f.source !== 'manual' ? ` <span class="badge">${esc(SOURCE_LABELS[f.source])}</span>` : '';
@@ -710,119 +726,246 @@
 
   function newFoodDraft() {
     return {
-      id: uid(), name: '', brand: '', source: 'manual', sourceId: null,
+      id: uid(), name: '', brand: '', source: 'manual', sourceId: null, unit: 'g',
       per100g: { kcal: null, protein: null, carbs: null, fat: null, fiber: null, sugar: null },
       servings: [], recipe: null, createdAt: nowIso(), updatedAt: nowIso(),
     };
   }
 
-  function servingRowHtml(s) {
+  function servingRowHtml(s, unit) {
     return `<div class="serving-row">
       <label class="field"><span>Serving name</span><input class="sv-label" value="${esc(s ? s.label : '')}" placeholder="e.g. 1 slice"></label>
-      <label class="field"><span>Grams</span><input class="sv-grams" inputmode="decimal" value="${s ? inputVal(s.grams) : ''}" placeholder="g"></label>
+      <label class="field"><span>Size (${baseLabel(unit)})</span><input class="sv-grams" inputmode="decimal" value="${s && isNum(s.grams) ? inputVal(s.grams) : ''}" placeholder="${baseLabel(unit)}"></label>
       <button type="button" class="btn ghost icon sv-remove" aria-label="Remove serving">✕</button>
     </div>`;
   }
 
+  /** Scales a nutrition object by `factor`, keeping null (missing) and NaN (invalid) as they are. */
+  function scaleValues(values, factor) {
+    const out = {};
+    FOOD_NUTR_KEYS.forEach((k) => { out[k] = isNum(values[k]) ? values[k] * factor : values[k]; });
+    return out;
+  }
+
   /**
    * Food editor. `food` may be a library food, a new draft, or an online result draft.
-   * opts: { title, saveLabel, notes: [], onSaved(food) }
+   * Nutrition can be typed per serving (as printed on a label) or per 100 g/mL; it is always
+   * stored per 100 g/mL so logging math stays exact.
+   * opts: { title, saveLabel, notes: [], onSaved(food), onCancel() }
    */
   function openFoodEditor(food, opts = {}) {
     if (food && food.recipe && typeof openRecipeEditor === 'function') { openRecipeEditor(food); return; }
     const f = food ? clone(food) : newFoodDraft();
     const existing = !!getFood(f.id);
     const missingKeys = existing ? [] : NUTR_KEYS.filter((k) => !isNum(f.per100g[k]) && f.source !== 'manual');
-    const nutrField = (k, required) => {
-      const miss = missingKeys.includes(k);
-      return `<label class="field"><span>${NUTR_LABELS[k]}${k === 'kcal' ? ' (kcal)' : ' (g)'}${required ? ' *' : ''}</span>
-        <input id="fe-${k}" inputmode="decimal" value="${inputVal(f.per100g[k])}" class="${miss ? 'missing' : ''}" ${miss ? 'placeholder="Missing — enter value"' : ''}>
-        ${miss ? '<span class="hint" style="color:var(--danger)">Not provided by the source</span>' : ''}</label>`;
-    };
     const notes = (opts.notes || []).slice();
     if (missingKeys.length) notes.unshift(`This result is missing ${missingKeys.map((k) => NUTR_LABELS[k].toLowerCase()).join(', ')}. Fill in the value from the label before saving — missing values are never treated as 0.`);
 
-    const body = `
+    // Editor state. `values` are in the basis currently shown (per serving or per 100).
+    const st = { name: f.name, brand: f.brand, unit: f.unit === 'ml' ? 'ml' : 'g', basis: 'serving', label: null, others: [], values: {} };
+    const startPerServing = f.servings.length > 0 || (!existing && f.source === 'manual');
+    if (startPerServing) {
+      const s0 = f.servings[0];
+      st.label = s0 ? { label: s0.label, size: s0.grams } : { label: '', size: null };
+      st.others = f.servings.slice(1);
+      st.values = s0 ? scaleValues(f.per100g, s0.grams / 100) : clone(f.per100g);
+    } else {
+      st.basis = '100';
+      st.others = f.servings.slice();
+      st.values = clone(f.per100g);
+    }
+
+    let dlg = null;
+    const u = () => baseLabel(st.unit);
+    const per100From = () => {
+      if (st.basis === '100') return clone(st.values);
+      const size = st.label && st.label.size;
+      return isNum(size) && size > 0 ? scaleValues(st.values, 100 / size) : null;
+    };
+
+    const nutrField = (k, required) => {
+      const miss = missingKeys.includes(k) && st.values[k] == null;
+      const v = st.values[k];
+      return `<label class="field"><span>${NUTR_LABELS[k]}${k === 'kcal' ? ' (kcal)' : ' (g)'}${required ? ' *' : ''}</span>
+        <input id="fe-${k}" inputmode="decimal" value="${isNum(v) ? inputVal(v) : ''}" class="${miss ? 'missing' : ''}" ${miss ? 'placeholder="Missing"' : ''}>
+        ${miss ? '<span class="hint" style="color:var(--danger)">Not provided by the source</span>' : ''}</label>`;
+    };
+
+    const bodyHtml = () => `
       ${notes.length ? `<div class="msg warn"><ul>${notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul></div>` : ''}
       ${f.source !== 'manual' ? `<p class="small muted">Source: ${esc(SOURCE_LABELS[f.source])}${f.sourceId ? ` (${esc(f.sourceId)})` : ''}. Values remain editable.</p>` : ''}
-      <label class="field"><span>Name *</span><input id="fe-name" value="${esc(f.name)}" autocomplete="off"></label>
-      <label class="field"><span>Brand</span><input id="fe-brand" value="${esc(f.brand)}" autocomplete="off"></label>
-      <h3>Nutrition per 100 g</h3>
+      <label class="field"><span>Name *</span><input id="fe-name" value="${esc(st.name)}" autocomplete="off"></label>
+      <label class="field"><span>Brand</span><input id="fe-brand" value="${esc(st.brand)}" autocomplete="off"></label>
+      <div class="field"><span>Measured by</span>
+        <div class="segmented" role="radiogroup" aria-label="Measured by">
+          <label><input type="radio" name="fe-unit" value="g" ${st.unit === 'g' ? 'checked' : ''}><span>Weight (g)</span></label>
+          <label><input type="radio" name="fe-unit" value="ml" ${st.unit === 'ml' ? 'checked' : ''}><span>Volume (mL)</span></label>
+        </div></div>
+      <div class="field"><span>Enter nutrition</span>
+        <div class="segmented" role="radiogroup" aria-label="Enter nutrition">
+          <label><input type="radio" name="fe-basis" value="serving" ${st.basis === 'serving' ? 'checked' : ''}><span>Per serving (label)</span></label>
+          <label><input type="radio" name="fe-basis" value="100" ${st.basis === '100' ? 'checked' : ''}><span>Per 100 ${u()}</span></label>
+        </div></div>
+      ${st.basis === 'serving' ? `
+        <h3>Serving size</h3>
+        <div class="grid-2">
+          <label class="field"><span>Serving name</span><input id="fe-ls-label" value="${esc(st.label.label)}" placeholder="e.g. 1 cup, 2 cookies" autocomplete="off"></label>
+          <label class="field"><span>Serving size (${u()}) *</span><input id="fe-ls-size" inputmode="decimal" value="${isNum(st.label.size) ? inputVal(st.label.size) : ''}" placeholder="${u()}"></label>
+        </div>
+        <p class="small muted">Copy these from the nutrition label, e.g. “1 cup” = 240 ${u()}.</p>` : ''}
+      <h3>Nutrition ${st.basis === 'serving' ? 'per serving' : `per 100 ${u()}`}</h3>
       <div class="grid-4">${NUTR_KEYS.map((k) => nutrField(k, true)).join('')}</div>
       <div class="grid-2">${nutrField('fiber', false)}${nutrField('sugar', false)}</div>
       <div id="fe-checks"></div>
-      <h3>Serving sizes</h3>
-      <p class="small muted">Named portions with their weight, e.g. “1 slice” = 28 g or “1 cup” = 240 g.</p>
-      <div id="fe-servings">${f.servings.map(servingRowHtml).join('')}</div>
+      <h3>${st.basis === 'serving' ? 'Other serving sizes' : 'Serving sizes'} <span class="muted small">(optional)</span></h3>
+      <p class="small muted">Extra portions you log by, e.g. “1 slice” = 28 g or “1 can” = 355 mL.</p>
+      <div id="fe-servings">${st.others.map((s) => servingRowHtml(s, st.unit)).join('')}</div>
       <button type="button" class="btn small" id="fe-add-serving">+ Add serving size</button>
       <div id="fe-errors"></div>`;
     const foot = `${existing ? '<button type="button" class="btn danger" id="fe-delete">Delete</button><span class="grow"></span>' : ''}
       <button type="button" class="btn" ${opts.onCancel ? 'id="fe-cancel"' : 'data-close'}>${opts.onCancel ? 'Back' : 'Cancel'}</button>
       <button type="button" class="btn primary" id="fe-save">${esc(opts.saveLabel || 'Save food')}</button>`;
-    const dlg = modal.open(opts.title || (existing ? 'Edit food' : 'New food'), body, foot);
 
-    const readPer100 = () => {
-      const p = {};
-      FOOD_NUTR_KEYS.forEach((k) => { p[k] = readNum(dlg.querySelector('#fe-' + k)); });
-      return p;
+    /**
+     * Copies the form into `st`. Values are null when empty and NaN when not a number.
+     * A field still showing exactly what we rendered keeps its exact stored number, so
+     * converted values aren't truncated to the 12 digits displayed in the input.
+     */
+    const readExact = (el, prev) => (isNum(prev) && el.value === inputVal(prev) ? prev : readNum(el));
+    const readForm = () => {
+      st.name = dlg.querySelector('#fe-name').value;
+      st.brand = dlg.querySelector('#fe-brand').value;
+      FOOD_NUTR_KEYS.forEach((k) => { st.values[k] = readExact(dlg.querySelector('#fe-' + k), st.values[k]); });
+      if (st.basis === 'serving') st.label = { label: dlg.querySelector('#fe-ls-label').value, size: readExact(dlg.querySelector('#fe-ls-size'), st.label.size) };
+      st.others = [...dlg.querySelectorAll('.serving-row')].map((row) => ({ label: row.querySelector('.sv-label').value, grams: readNum(row.querySelector('.sv-grams')) }));
     };
+
     const showChecks = () => {
-      const p = readPer100();
-      const filled = NUTR_KEYS.every((k) => p[k] !== null);
-      const { errors, warnings } = checkPer100g(p);
+      readForm();
       const box = dlg.querySelector('#fe-checks');
-      // Only surface errors once the user has filled the required fields, to avoid noise while typing.
-      const shownErrors = filled ? errors : errors.filter((e) => !/required/.test(e));
-      box.innerHTML = (shownErrors.length ? `<div class="msg error"><ul>${shownErrors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>` : '') +
-        (warnings.length ? `<div class="msg warn"><b>Check these values:</b><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : '');
+      const p = per100From();
+      const filled = NUTR_KEYS.every((k) => st.values[k] !== null);
+      if (!p) {
+        box.innerHTML = filled ? '<p class="small muted">Enter the serving size to check these values.</p>' : '';
+        return;
+      }
+      const { errors, warnings } = checkPer100g(p, st.unit);
+      const shownErrors = errors.filter((e) => !/required/.test(e));
+      const per100Line = st.basis === 'serving' && NUTR_KEYS.every((k) => isNum(p[k]))
+        ? `<p class="small muted">Saved as ${fmtKcal(p.kcal)} kcal · P ${fmtG(p.protein)} g · C ${fmtG(p.carbs)} g · F ${fmtG(p.fat)} g per 100 ${u()}.</p>` : '';
+      box.innerHTML = per100Line +
+        (shownErrors.length ? `<div class="msg error"><ul>${shownErrors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>` : '') +
+        (filled && warnings.length ? `<div class="msg warn"><b>Check these values:</b><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : '');
     };
-    dlg.querySelector('.modal-body').addEventListener('input', (ev) => {
-      if (ev.target.id && ev.target.id.startsWith('fe-')) {
+
+    const switchBasis = (to) => {
+      readForm();
+      const err = dlg.querySelector('#fe-errors');
+      const badValue = FOOD_NUTR_KEYS.some((k) => Number.isNaN(st.values[k]));
+      if (badValue) {
+        err.innerHTML = '<div class="msg error">Fix the values that aren’t numbers before switching.</div>';
+        dlg.querySelector(`input[name="fe-basis"][value="${st.basis}"]`).checked = true;
+        return;
+      }
+      if (to === '100') {
+        const size = st.label.size;
+        const anyValue = FOOD_NUTR_KEYS.some((k) => isNum(st.values[k]));
+        if (!(isNum(size) && size > 0)) {
+          if (anyValue) {
+            err.innerHTML = '<div class="msg error">Enter the serving size first so the values can be converted.</div>';
+            dlg.querySelector('input[name="fe-basis"][value="serving"]').checked = true;
+            return;
+          }
+        } else {
+          st.values = scaleValues(st.values, 100 / size);
+          st.others.unshift({ label: st.label.label.trim() || '1 serving', grams: size });
+        }
+        st.label = null;
+      } else {
+        const i = st.others.findIndex((s) => s.label.trim() && isNum(s.grams) && s.grams > 0);
+        if (i >= 0) {
+          const s = st.others.splice(i, 1)[0];
+          st.label = { label: s.label, size: s.grams };
+          st.values = scaleValues(st.values, s.grams / 100);
+        } else {
+          // Per-100 values are exactly the values for a 100 g/mL serving.
+          st.label = { label: '100 ' + u(), size: 100 };
+        }
+      }
+      st.basis = to;
+      draw();
+    };
+
+    function draw() {
+      dlg = modal.open(opts.title || (existing ? 'Edit food' : 'New food'), bodyHtml(), foot);
+      const body = dlg.querySelector('.modal-body');
+      body.addEventListener('input', (ev) => {
+        if (ev.target.type === 'radio') return;
         ev.target.classList.remove('invalid');
         if (ev.target.classList.contains('missing') && ev.target.value.trim()) ev.target.classList.remove('missing');
         showChecks();
-      }
-    });
-    dlg.querySelector('#fe-add-serving').addEventListener('click', () => {
-      dlg.querySelector('#fe-servings').insertAdjacentHTML('beforeend', servingRowHtml(null));
-      const rows = dlg.querySelectorAll('.serving-row');
-      rows[rows.length - 1].querySelector('.sv-label').focus();
-    });
-    dlg.querySelector('#fe-servings').addEventListener('click', (ev) => {
-      const rm = ev.target.closest('.sv-remove');
-      if (rm) rm.closest('.serving-row').remove();
-    });
-    const del = dlg.querySelector('#fe-delete');
-    if (del) del.addEventListener('click', async () => {
-      if (await deleteFood(f.id)) { modal.close(); render(); }
-    });
-    const cancel = dlg.querySelector('#fe-cancel');
-    if (cancel) cancel.addEventListener('click', () => opts.onCancel());
-    dlg.querySelector('#fe-save').addEventListener('click', () => {
+      });
+      body.addEventListener('change', (ev) => {
+        if (ev.target.name === 'fe-basis') switchBasis(ev.target.value);
+        else if (ev.target.name === 'fe-unit') { readForm(); st.unit = ev.target.value; draw(); }
+      });
+      dlg.querySelector('#fe-add-serving').addEventListener('click', () => {
+        dlg.querySelector('#fe-servings').insertAdjacentHTML('beforeend', servingRowHtml(null, st.unit));
+        const rows = dlg.querySelectorAll('.serving-row');
+        rows[rows.length - 1].querySelector('.sv-label').focus();
+      });
+      dlg.querySelector('#fe-servings').addEventListener('click', (ev) => {
+        const rm = ev.target.closest('.sv-remove');
+        if (rm) rm.closest('.serving-row').remove();
+      });
+      const del = dlg.querySelector('#fe-delete');
+      if (del) del.addEventListener('click', async () => {
+        if (await deleteFood(f.id)) { modal.close(); render(); }
+      });
+      const cancel = dlg.querySelector('#fe-cancel');
+      if (cancel) cancel.addEventListener('click', () => opts.onCancel());
+      dlg.querySelector('#fe-save').addEventListener('click', save);
+      showChecks();
+    }
+
+    function save() {
+      readForm();
       const errors = [];
-      const nameEl = dlg.querySelector('#fe-name');
-      const name = nameEl.value.trim();
-      nameEl.classList.toggle('invalid', !name);
+      const mark = (sel, bad) => { const el = dlg.querySelector(sel); if (el) el.classList.toggle('invalid', !!bad); };
+      const name = st.name.trim();
+      mark('#fe-name', !name);
       if (!name) errors.push('Name is required.');
-      const p = readPer100();
+      let labelServing = null;
+      if (st.basis === 'serving') {
+        const size = st.label.size;
+        const ok = isNum(size) && size > 0;
+        mark('#fe-ls-size', !ok);
+        if (!ok) errors.push(`Serving size must be a number of ${u()} greater than 0.`);
+        else labelServing = { label: st.label.label.trim() || '1 serving', grams: size };
+      }
+      const where = st.basis === 'serving' ? 'per serving' : `per 100 ${u()}`;
       FOOD_NUTR_KEYS.forEach((k) => {
-        const el = dlg.querySelector('#fe-' + k);
+        const v = st.values[k];
         const required = NUTR_KEYS.includes(k);
-        el.classList.toggle('invalid', Number.isNaN(p[k]) || (isNum(p[k]) && p[k] < 0) || (required && p[k] === null));
+        let msg = '';
+        if (v === null && required) msg = `${NUTR_LABELS[k]} ${where} is required.`;
+        else if (Number.isNaN(v)) msg = `${NUTR_LABELS[k]} must be a number.`;
+        else if (isNum(v) && v < 0) msg = `${NUTR_LABELS[k]} can't be negative.`;
+        mark('#fe-' + k, msg);
+        if (msg) errors.push(msg);
       });
-      errors.push(...checkPer100g(p).errors);
-      const servings = [];
+      const servings = labelServing ? [labelServing] : [];
       dlg.querySelectorAll('.serving-row').forEach((row, i) => {
-        const lEl = row.querySelector('.sv-label');
-        const gEl = row.querySelector('.sv-grams');
-        const label = lEl.value.trim();
-        const grams = readNum(gEl);
-        if (!label && grams === null) return; // blank row: ignore
+        const s = st.others[i];
+        const label = s.label.trim();
+        if (!label && s.grams === null) return; // blank row: ignore
         let bad = false;
-        if (!label) { errors.push(`Serving #${i + 1} needs a name.`); lEl.classList.add('invalid'); bad = true; }
-        if (!isNum(grams) || grams <= 0) { errors.push(`Serving #${i + 1} needs a gram weight greater than 0.`); gEl.classList.add('invalid'); bad = true; }
-        if (!bad) servings.push({ label, grams });
+        if (!label) { errors.push(`Serving size #${i + 1} needs a name.`); row.querySelector('.sv-label').classList.add('invalid'); bad = true; }
+        if (!isNum(s.grams) || s.grams <= 0) { errors.push(`Serving size #${i + 1} needs an amount in ${u()} greater than 0.`); row.querySelector('.sv-grams').classList.add('invalid'); bad = true; }
+        if (!bad) servings.push({ label, grams: s.grams });
       });
+      const p = per100From();
+      if (!errors.length && p) errors.push(...checkPer100g(p, st.unit).errors);
       const box = dlg.querySelector('#fe-errors');
       if (errors.length) {
         box.innerHTML = `<div class="msg error"><b>Can't save yet:</b><ul>${errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>`;
@@ -830,22 +973,24 @@
         return;
       }
       f.name = name;
-      f.brand = dlg.querySelector('#fe-brand').value.trim();
+      f.brand = st.brand.trim();
+      f.unit = st.unit;
       f.per100g = p;
       f.servings = servings;
       const saved = upsertFood(f);
       if (opts.onSaved) opts.onSaved(saved);
       else { modal.close(); toast(existing ? 'Food updated.' : 'Food saved to library.'); render(); }
-    });
-    showChecks();
-    if (!existing && !f.name) dlg.querySelector('#fe-name').focus();
+    }
+
+    draw();
+    if (!existing && !st.name) dlg.querySelector('#fe-name').focus();
   }
 
   function foodListItemHtml(f) {
-    const extra = f.servings.length ? ` · ${f.servings.length} serving size${f.servings.length > 1 ? 's' : ''}` : '';
+    const extra = f.servings.length > 1 ? ` · ${f.servings.length} serving sizes` : '';
     return `<li><button type="button" class="list-item" data-action="edit-food" data-id="${esc(f.id)}">
       <div class="title">${esc(f.name)}${sourceBadge(f)}</div>
-      <div class="sub">${f.brand ? esc(f.brand) + ' · ' : ''}${per100Html(f.per100g)}${extra}</div>
+      <div class="sub">${f.brand ? esc(f.brand) + ' · ' : ''}${nutritionSummaryHtml(f)}${extra}</div>
     </button></li>`;
   }
 
@@ -881,14 +1026,19 @@
   function entriesFor(k) { return data.logs[k] || []; }
   function dayTotals(k) { return sumNutrition(entriesFor(k).map((e) => e.nutrition)); }
 
-  function unitOptions(servings) {
-    return [{ key: 'g', label: 'g', grams: 1 }, { key: 'oz', label: 'oz', grams: G_PER_OZ }]
-      .concat((servings || []).map((s, i) => ({ key: 's' + i, label: s.label, grams: s.grams })));
+  /** Units offered when logging: the base unit, its ounce equivalent, then the food's servings. */
+  function unitOptions(servings, unit) {
+    const base = unit === 'ml'
+      ? [{ key: 'ml', label: 'mL', grams: 1, text: 'millilitres (mL)' }, { key: 'floz', label: 'fl oz', grams: ML_PER_FL_OZ, text: 'fluid ounces (US fl oz)' }]
+      : [{ key: 'g', label: 'g', grams: 1, text: 'grams (g)' }, { key: 'oz', label: 'oz', grams: G_PER_OZ, text: 'ounces (oz)' }];
+    return base.concat((servings || []).map((s, i) => ({ key: 's' + i, label: s.label, grams: s.grams, text: `${s.label} (${fmtQty(s.grams)} ${baseLabel(unit)})` })));
   }
+  /** e: { grams (amount in base unit), unit, unitLabel, unitQty } */
   function amountText(e) {
-    if (e.unitLabel === 'g') return `${fmtQty(e.grams)} g`;
-    if (e.unitLabel === 'oz') return `${fmtQty(e.unitQty)} oz (${fmtQty(e.grams)} g)`;
-    return `${fmtQty(e.unitQty)} × ${e.unitLabel} (${fmtQty(e.grams)} g)`;
+    const b = baseLabel(e.unit);
+    if (e.unitLabel === b) return `${fmtQty(e.grams)} ${b}`;
+    if (e.unitLabel === 'oz' || e.unitLabel === 'fl oz') return `${fmtQty(e.unitQty)} ${e.unitLabel} (${fmtQty(e.grams)} ${b})`;
+    return `${fmtQty(e.unitQty)} × ${e.unitLabel} (${fmtQty(e.grams)} ${b})`;
   }
   function guessMeal() {
     const h = new Date().getHours() + new Date().getMinutes() / 60;
@@ -899,12 +1049,12 @@
   }
   /** What gets snapshotted into an entry: identity, per-100 g core nutrition and servings. */
   function foodSource(f) {
-    return { foodId: f.id, name: f.name, brand: f.brand, per100g: normNutr(f.per100g, NUTR_KEYS), servings: clone(f.servings) };
+    return { foodId: f.id, name: f.name, brand: f.brand, unit: f.unit, per100g: normNutr(f.per100g, NUTR_KEYS), servings: clone(f.servings) };
   }
   function makeEntry(src, grams, unitLabel, unitQty, meal) {
     return {
       id: uid(), meal, foodId: src.foodId || null, name: src.name, brand: src.brand || '',
-      grams, unitLabel, unitQty,
+      grams, unit: src.unit === 'ml' ? 'ml' : 'g', unitLabel, unitQty,
       per100g: clone(src.per100g), servings: clone(src.servings || []),
       nutrition: scaleNutrition(src.per100g, grams),
       createdAt: nowIso(),
@@ -941,20 +1091,21 @@
   /** Re-add source for a recent entry: current library values when the food still exists, else the snapshot. */
   function recentSource(e) {
     const f = e.foodId && getFood(e.foodId);
-    return f ? foodSource(f) : { foodId: e.foodId, name: e.name, brand: e.brand, per100g: clone(e.per100g), servings: clone(e.servings) };
+    return f ? foodSource(f) : { foodId: e.foodId, name: e.name, brand: e.brand, unit: e.unit, per100g: clone(e.per100g), servings: clone(e.servings) };
   }
   /** Resolve a previous amount against a (possibly updated) source: same unit and quantity. */
   function resolveAmount(src, unitLabel, unitQty, grams) {
-    const opt = unitOptions(src.servings).find((o) => o.label === unitLabel);
+    const opts = unitOptions(src.servings, src.unit);
+    const opt = opts.find((o) => o.label === unitLabel);
     if (opt) return { unit: opt, qty: unitQty, grams: unitQty * opt.grams };
-    return { unit: unitOptions([])[0], qty: grams, grams };
+    return { unit: opts[0], qty: grams, grams };
   }
   function quickReAdd(e, meal, k) {
     const src = recentSource(e);
     if (NUTR_KEYS.some((n) => !isNum(src.per100g[n]))) { toast('This food has incomplete nutrition. Edit it first.'); return; }
     const a = resolveAmount(src, e.unitLabel, e.unitQty, e.grams);
     addEntry(k, makeEntry(src, a.grams, a.unit.label, a.qty, meal));
-    toast(`Added ${src.name} (${amountText({ grams: a.grams, unitLabel: a.unit.label, unitQty: a.qty })}) to ${mealLabel(meal)}.`);
+    toast(`Added ${src.name} (${amountText({ grams: a.grams, unit: src.unit, unitLabel: a.unit.label, unitQty: a.qty })}) to ${mealLabel(meal)}.`);
   }
 
   // ---------------------------------------------------------------------
@@ -966,7 +1117,7 @@
   function openPortion(opts) {
     const { src, date } = opts;
     const editing = opts.entry || null;
-    const options = unitOptions(src.servings);
+    const options = unitOptions(src.servings, src.unit);
     let unit = options[0];
     let qty = 100;
     const preset = editing || opts.preset;
@@ -980,13 +1131,13 @@
     const body = `
       <div>
         <div class="title"><b>${esc(src.name)}</b>${src.brand ? ` <span class="muted">· ${esc(src.brand)}</span>` : ''}</div>
-        <div class="small muted">${per100Html(src.per100g)}</div>
+        <div class="small muted">${nutritionSummaryHtml(src)}</div>
         ${editing ? '<p class="small muted">Uses the nutrition saved when this entry was logged, so library edits never change past days.</p>' : ''}
       </div>
       <div class="grid-2">
         <label class="field"><span>Amount</span><input id="pt-qty" inputmode="decimal" value="${inputVal(qty)}" autocomplete="off"></label>
         <label class="field"><span>Unit</span><select id="pt-unit">${options.map((o) =>
-          `<option value="${o.key}" ${o.key === unit.key ? 'selected' : ''}>${esc(o.key === 'g' ? 'grams (g)' : o.key === 'oz' ? 'ounces (oz)' : `${o.label} (${fmtQty(o.grams)} g)`)}</option>`).join('')}</select></label>
+          `<option value="${o.key}" ${o.key === unit.key ? 'selected' : ''}>${esc(o.text)}</option>`).join('')}</select></label>
       </div>
       <label class="field"><span>Meal</span><select id="pt-meal">${MEALS.map((m) =>
         `<option value="${m.key}" ${m.key === meal ? 'selected' : ''}>${m.label}</option>`).join('')}</select></label>
@@ -1010,7 +1161,8 @@
       const box = dlg.querySelector('#pt-preview');
       qtyEl.classList.toggle('invalid', !!r.error && qtyEl.value.trim() !== '');
       if (r.error) { box.innerHTML = `<span class="muted">${esc(r.error)}</span>`; return; }
-      const gramsLine = r.u.key === 'g' ? `${fmtQty(r.grams)} g` : `${fmtQty(r.q)} × ${esc(r.u.key === 'oz' ? '1 oz' : r.u.label)} = <b>${fmtQty(r.grams)} g</b>`;
+      const b = baseLabel(src.unit);
+      const gramsLine = r.u.grams === 1 && r.u.label === b ? `${fmtQty(r.grams)} ${b}` : `${fmtQty(r.q)} × ${esc(r.u.key === 'oz' || r.u.key === 'floz' ? '1 ' + r.u.label : r.u.label)} = <b>${fmtQty(r.grams)} ${b}</b>`;
       box.innerHTML = `<div class="small muted">${gramsLine}</div>
         <div><span class="big">${fmtKcal(r.n.kcal)}</span> kcal</div>
         <div class="mac">${macHtml(r.n)}</div>`;
@@ -1081,7 +1233,7 @@
     const src = recentSource(e);
     const a = resolveAmount(src, e.unitLabel, e.unitQty, e.grams);
     const n = scaleNutrition(src.per100g, a.grams);
-    const amt = amountText({ grams: a.grams, unitLabel: a.unit.label, unitQty: a.qty });
+    const amt = amountText({ grams: a.grams, unit: src.unit, unitLabel: a.unit.label, unitQty: a.qty });
     return `<li class="list-row">
       <button type="button" class="list-item" data-recent="${esc(e.id)}">
         <div class="title">${esc(e.name)}</div>
@@ -1093,7 +1245,7 @@
   function libraryRowHtml(f) {
     return `<li><button type="button" class="list-item" data-pick-food="${esc(f.id)}">
       <div class="title">${esc(f.name)}${sourceBadge(f)}</div>
-      <div class="sub">${f.brand ? esc(f.brand) + ' · ' : ''}${per100Html(f.per100g)}</div>
+      <div class="sub">${f.brand ? esc(f.brand) + ' · ' : ''}${nutritionSummaryHtml(f)}</div>
     </button></li>`;
   }
 
@@ -1257,23 +1409,24 @@
     const per100g = {
       kcal, protein: v('proteins'), carbs: v('carbohydrates'), fat: v('fat'), fiber: v('fiber'), sugar: v('sugars'),
     };
+    // Nutrition is per 100 mL when the product says so; then the food is measured in mL.
+    const unit = String(p.nutrition_data_per || '').toLowerCase() === '100ml' ? 'ml' : 'g';
     const servings = [];
     const sq = toNum(p.serving_quantity);
     const squ = String(p.serving_quantity_unit || 'g').toLowerCase();
-    if (sq && (squ === 'g' || squ === 'ml')) addServing(servings, p.serving_size ? `1 serving (${String(p.serving_size).trim()})` : '1 serving', sq);
+    const sizeText = p.serving_size ? String(p.serving_size).trim() : '';
+    if (sq && squ === unit) addServing(servings, sizeText ? `1 serving (${sizeText})` : '1 serving', sq);
+    else if (sq && (squ === 'g' || squ === 'ml')) notes.push(`The label serving (${sizeText || fmtQty(sq) + ' ' + squ}) is in ${squ === 'ml' ? 'mL' : 'g'} but nutrition is per 100 ${baseLabel(unit)}, so it wasn't added as a serving size.`);
     const pq = toNum(p.product_quantity);
     const pqu = String(p.product_quantity_unit || 'g').toLowerCase();
-    if (pq && (pqu === 'g' || pqu === 'ml')) addServing(servings, `1 package (${fmtQty(pq)} ${pqu})`, pq);
-    if (String(p.nutrition_data_per || '').toLowerCase() === '100ml' || squ === 'ml' || pqu === 'ml') {
-      notes.push('This product is measured by volume; values are per 100 ml and are treated as per 100 g (exact for water-like liquids).');
-    }
+    if (pq && pqu === unit) addServing(servings, `1 package (${fmtQty(pq)} ${baseLabel(unit)})`, pq);
     const name = String(p.product_name || p.product_name_en || p.generic_name || '').trim();
     return {
       source: 'openfoodfacts',
       sourceId: p.code ? String(p.code) : null,
       name: name || 'Unnamed product',
       brand: String(p.brands || '').split(',')[0].trim(),
-      per100g, servings, notes,
+      unit, per100g, servings, notes,
     };
   }
 
@@ -1311,22 +1464,25 @@
       kcal, protein: get('203'), carbs: get('205'), fat: get('204'), fiber: get('291'), sugar: get('269', '269.3'),
     };
     const servings = [];
-    const unit = String(f.servingSizeUnit || '').toLowerCase();
-    if (toNum(f.servingSize) && (unit === 'g' || unit === 'grm' || unit === 'ml' || unit === 'mlt')) {
+    const su = String(f.servingSizeUnit || '').toLowerCase();
+    // Branded foods with an mL serving report nutrients per 100 mL.
+    const unit = su === 'ml' || su === 'mlt' ? 'ml' : 'g';
+    if (toNum(f.servingSize) && (su === 'g' || su === 'grm' || unit === 'ml')) {
       addServing(servings, f.householdServingFullText ? `1 serving (${String(f.householdServingFullText).trim()})` : '1 serving', toNum(f.servingSize));
-      if (unit === 'ml' || unit === 'mlt') notes.push('Serving is measured in ml; treated as grams (exact for water-like liquids).');
     }
-    (Array.isArray(f.foodMeasures) ? f.foodMeasures : []).slice(0, 10).forEach((m) => {
-      const label = String(m.disseminationText || '').trim();
-      if (label && !/quantity not specified/i.test(label)) addServing(servings, label, toNum(m.gramWeight));
-    });
+    if (unit === 'g') {
+      (Array.isArray(f.foodMeasures) ? f.foodMeasures : []).slice(0, 10).forEach((m) => {
+        const label = String(m.disseminationText || '').trim();
+        if (label && !/quantity not specified/i.test(label)) addServing(servings, label, toNum(m.gramWeight));
+      });
+    }
     const name = String(f.description || '').trim();
     return {
       source: 'usda',
       sourceId: f.fdcId != null ? String(f.fdcId) : null,
       name: name || 'Unnamed food',
       brand: String(f.brandName || f.brandOwner || '').trim(),
-      per100g, servings, notes,
+      unit, per100g, servings, notes,
       dataType: f.dataType || '',
     };
   }
@@ -1359,7 +1515,7 @@
     const missing = NUTR_KEYS.filter((k) => !isNum(r.per100g[k]));
     return `<li><button type="button" class="list-item" data-online="${slot}:${i}">
       <div class="title">${esc(r.name)}${missing.length ? ' <span class="badge missing">incomplete</span>' : ''}${r.notes.length ? ' <span class="badge warn">check</span>' : ''}</div>
-      <div class="sub">${r.brand ? esc(r.brand) + ' · ' : ''}${r.dataType ? esc(r.dataType) + ' · ' : ''}${per100Html(r.per100g)}${r.servings.length ? ` · ${r.servings.length} serving size${r.servings.length > 1 ? 's' : ''}` : ''}</div>
+      <div class="sub">${r.brand ? esc(r.brand) + ' · ' : ''}${r.dataType ? esc(r.dataType) + ' · ' : ''}${per100Html(r.per100g, r.unit)}${r.servings.length ? ` · ${r.servings.length} serving size${r.servings.length > 1 ? 's' : ''}` : ''}</div>
     </button></li>`;
   }
 
@@ -1386,7 +1542,7 @@
         <button type="button" class="btn block" data-search-online>${isBarcode(q) ? 'Look up barcode' : 'Search'} “${esc(q)}” in ${sources}</button>`;
     }
     return onlineSectionHtml('off', isBarcode(q) ? 'Open Food Facts — barcode' : 'Open Food Facts') + onlineSectionHtml('usda', 'USDA FoodData Central') +
-      `<p class="small muted">Values are shown per 100 g. Results marked <span class="badge missing">incomplete</span> need missing values filled in before saving.</p>`;
+      `<p class="small muted">Values are shown per 100 g (or per 100 mL for drinks); you can switch to per serving when reviewing. Results marked <span class="badge missing">incomplete</span> need missing values filled in before saving.</p>`;
   }
 
   function pickOnline(r, back) {
@@ -1400,7 +1556,7 @@
     const draft = newFoodDraft();
     Object.assign(draft, {
       name: r.name, brand: r.brand, source: r.source, sourceId: r.sourceId,
-      per100g: clone(r.per100g), servings: clone(r.servings),
+      unit: r.unit, per100g: clone(r.per100g), servings: clone(r.servings),
     });
     openFoodEditor(draft, {
       title: 'Review & save',
@@ -1493,12 +1649,12 @@
       if (snapIdx != null && !getFood(snaps[snapIdx].foodId)) {
         html += `<option value="snap:${snapIdx}" selected>${esc(snaps[snapIdx].name)} (no longer in library)</option>`;
       }
-      html += choices.map((c) => `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}${c.brand ? ' — ' + esc(c.brand) : ''}</option>`).join('');
+      html += choices.map((c) => `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}${c.brand ? ' — ' + esc(c.brand) : ''}${c.unit === 'ml' ? ' (mL)' : ''}</option>`).join('');
       return html;
     };
     const rowHtml = (ing, idx) => `<div class="ingredient-row">
         <label class="field"><span>Ingredient</span><select class="ig-food">${optionsHtml(ing ? ing.foodId : '', ing ? idx : null)}</select></label>
-        <label class="field"><span>Grams</span><input class="ig-grams" inputmode="decimal" value="${ing ? inputVal(ing.grams) : ''}"></label>
+        <label class="field"><span>Amount (g/mL)</span><input class="ig-grams" inputmode="decimal" value="${ing ? inputVal(ing.grams) : ''}"></label>
         <button type="button" class="btn ghost icon ig-remove" aria-label="Remove ingredient">✕</button>
         <div class="mac muted ig-info"></div>
       </div>`;
@@ -1526,9 +1682,11 @@
       if (!val) return null;
       if (val.startsWith('snap:')) { const sn = snaps[Number(val.slice(5))]; return sn ? { foodId: sn.foodId, name: sn.name, per100g: sn.per100g } : null; }
       const lf = getFood(val);
-      return lf ? { foodId: lf.id, name: lf.name, per100g: normNutr(lf.per100g, NUTR_KEYS) } : null;
+      return lf ? { foodId: lf.id, name: lf.name, unit: lf.unit, per100g: normNutr(lf.per100g, NUTR_KEYS) } : null;
     };
+    let hasVolume = false;
     const read = () => {
+      hasVolume = false;
       const errors = [];
       const ingredients = [];
       rowsEl.querySelectorAll('.ingredient-row').forEach((row, i) => {
@@ -1539,9 +1697,10 @@
         const info = row.querySelector('.ig-info');
         if (!src && g === null) { info.textContent = ''; return; }
         if (!src) { errors.push(`Ingredient #${i + 1}: choose a food.`); info.textContent = ''; return; }
-        if (!isNum(g) || g <= 0) { errors.push(`Ingredient #${i + 1} (${src.name}): enter grams greater than 0.`); info.textContent = ''; return; }
+        if (!isNum(g) || g <= 0) { errors.push(`Ingredient #${i + 1} (${src.name}): enter an amount greater than 0.`); info.textContent = ''; return; }
         const n = scaleNutrition(src.per100g, g);
-        info.innerHTML = `${fmtKcal(n.kcal)} kcal · ${macHtml(n)}`;
+        info.innerHTML = `${fmtQty(g)} ${baseLabel(src.unit)}: ${fmtKcal(n.kcal)} kcal · ${macHtml(n)}`;
+        if (src.unit === 'ml') hasVolume = true;
         ingredients.push({ foodId: src.foodId, name: src.name, grams: g, per100g: clone(src.per100g) });
       });
       const cooked = readNum(dlg.querySelector('#rc-cooked'));
@@ -1557,7 +1716,7 @@
       const c = computeRecipe(r.ingredients, r.cooked);
       const ratio = r.cooked ? r.cooked / c.rawWeight : 1;
       box.innerHTML = `<div><b>Whole recipe:</b> ${fmtKcal(c.totals.kcal)} kcal · <span class="mac">${macHtml(c.totals)}</span></div>
-        <div class="small muted">Raw ingredients ${fmtQty(c.rawWeight)} g${r.cooked ? ` → cooked ${fmtQty(r.cooked)} g (${Math.round(ratio * 100)}% of raw)` : ''}</div>
+        <div class="small muted">Raw ingredients ${fmtQty(c.rawWeight)} g${hasVolume && !r.cooked ? ' (mL counted as g — enter the cooked weight for an exact result)' : ''}${r.cooked ? ` → cooked ${fmtQty(r.cooked)} g (${Math.round(ratio * 100)}% of raw)` : ''}</div>
         <div style="margin-top:6px"><b>Per 100 g ${r.cooked ? 'cooked' : ''}:</b> ${fmtKcal(c.per100g.kcal)} kcal · <span class="mac">${macHtml(c.per100g)}</span></div>
         ${r.portions ? `<div><b>Per portion</b> (${fmtQty(c.weight / r.portions)} g): ${fmtKcal(c.totals.kcal / r.portions)} kcal · <span class="mac">${macHtml(scaleNutrition(c.per100g, c.weight / r.portions))}</span></div>` : ''}`;
       return r;
@@ -1705,7 +1864,7 @@
     'add-food': (ds) => openAddFood(ds.meal),
     'edit-entry': (ds) => {
       const e = findEntry(ui.date, ds.id);
-      if (e) openPortion({ src: { foodId: e.foodId, name: e.name, brand: e.brand, per100g: e.per100g, servings: e.servings }, date: ui.date, entry: e });
+      if (e) openPortion({ src: { foodId: e.foodId, name: e.name, brand: e.brand, unit: e.unit, per100g: e.per100g, servings: e.servings }, date: ui.date, entry: e });
     },
   });
   // ---------------------------------------------------------------------
