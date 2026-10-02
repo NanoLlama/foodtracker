@@ -856,6 +856,7 @@
         <div class="searchbar"><input type="search" id="food-search" placeholder="Search my foods" value="${esc(ui.foodQuery)}" autocomplete="off" aria-label="Search my foods"></div>
         <div class="row" id="food-tools">
           <button type="button" class="btn primary" data-action="new-food">+ New food</button>
+          <button type="button" class="btn" data-action="new-recipe">+ New recipe</button>
           <button type="button" class="btn" data-action="find-online">Find online</button>
         </div>
       </div>
@@ -1132,7 +1133,7 @@
         <div class="field"><span>Day</span><div style="min-height:44px;display:flex;align-items:center"><b>${logMode ? esc(fmtDate(addState.date, { weekday: 'short', month: 'short', day: 'numeric' })) : ''}</b></div></div>
       </div>
       <form class="searchbar" id="af-form" role="search">
-        <input type="search" id="af-q" placeholder="${hasOnline ? 'Search foods or enter a barcode' : 'Search my foods'}" value="${esc(addState.query)}" autocomplete="off" aria-label="Search foods">
+        <input type="search" id="af-q" placeholder="${hasOnline ? 'Food name or barcode' : 'Search my foods'}" value="${esc(addState.query)}" autocomplete="off" aria-label="Search foods">
         ${hasOnline ? '<button type="submit" class="btn primary">Search online</button>' : ''}
       </form>
       <div id="af-results">${addResultsHtml()}</div>`;
@@ -1426,6 +1427,179 @@
   }
   actions['find-online'] = openFindOnline;
 
+
+  // ---------------------------------------------------------------------
+  // Copy previous day / meal
+  // ---------------------------------------------------------------------
+  function copyEntries(fromKey, toKey, meal) {
+    const src = entriesFor(fromKey).filter((e) => !meal || e.meal === meal);
+    if (!src.length) return 0;
+    const list = data.logs[toKey] || (data.logs[toKey] = []);
+    src.forEach((e) => list.push(Object.assign(clone(e), { id: uid(), createdAt: nowIso() })));
+    saveData();
+    return src.length;
+  }
+  const prevDayPhrase = () => (ui.date === todayKey() ? 'yesterday' : fmtDate(addDays(ui.date, -1), { month: 'short', day: 'numeric' }));
+
+  function copyMealButtonHtml(meal) {
+    const n = entriesFor(addDays(ui.date, -1)).filter((e) => e.meal === meal.key).length;
+    if (!n) return '';
+    const label = ui.date === todayKey() ? `Copy yesterday's ${meal.label.toLowerCase()}` : `Copy ${meal.label.toLowerCase()} from ${prevDayPhrase()}`;
+    return `<div style="padding:6px 8px;border-top:1px solid var(--border)"><button type="button" class="btn ghost small" data-action="copy-meal" data-meal="${meal.key}">⧉ ${esc(label)} (${n} item${n > 1 ? 's' : ''})</button></div>`;
+  }
+  function copyDayButtonHtml() {
+    const n = entriesFor(addDays(ui.date, -1)).length;
+    return `<button type="button" class="btn" data-action="copy-day" ${n ? '' : 'disabled title="Nothing logged on the previous day"'}>⧉ Copy entire previous day</button>`;
+  }
+
+  actions['copy-meal'] = (ds) => {
+    const n = copyEntries(addDays(ui.date, -1), ui.date, ds.meal);
+    toast(n ? `Copied ${n} item${n > 1 ? 's' : ''} to ${mealLabel(ds.meal)}.` : 'Nothing to copy.');
+    render();
+  };
+  actions['copy-day'] = async () => {
+    const from = addDays(ui.date, -1);
+    const n = entriesFor(from).length;
+    if (!n) { toast('Nothing logged on the previous day.'); return; }
+    if (entriesFor(ui.date).length) {
+      const ok = await confirmAsk('Copy previous day?', `Add all ${n} entries from ${fmtDate(from)} to this day? Entries already here are kept.`, 'Copy');
+      if (!ok) return;
+    }
+    copyEntries(from, ui.date, null);
+    toast(`Copied ${n} entr${n > 1 ? 'ies' : 'y'} from ${prevDayPhrase()}.`);
+    render();
+  };
+
+  // ---------------------------------------------------------------------
+  // Recipes: nutrition computed from ingredients; per 100 g of the cooked dish
+  // ---------------------------------------------------------------------
+  /** totals = Σ ingredient per100g × grams / 100; per100g = totals × 100 / (cooked weight or raw weight). */
+  function computeRecipe(ingredients, cookedWeightG) {
+    const rawWeight = ingredients.reduce((a, i) => a + i.grams, 0);
+    const totals = sumNutrition(ingredients.map((i) => scaleNutrition(i.per100g, i.grams)));
+    const weight = isNum(cookedWeightG) && cookedWeightG > 0 ? cookedWeightG : rawWeight;
+    const per100g = {};
+    NUTR_KEYS.forEach((k) => { per100g[k] = weight > 0 ? (totals[k] * 100) / weight : NaN; });
+    return { rawWeight, weight, totals, per100g };
+  }
+
+  function openRecipeEditor(food) {
+    const existing = !!(food && getFood(food.id));
+    const f = food ? clone(food) : Object.assign(newFoodDraft(), { source: 'recipe', recipe: { ingredients: [], cookedWeightG: null, portions: null } });
+    const snaps = f.recipe.ingredients; // snapshots used if an ingredient was removed from the library
+    const choices = searchFoods('').filter((x) => x.id !== f.id && NUTR_KEYS.every((k) => isNum(x.per100g[k])));
+    const optionsHtml = (selected, snapIdx) => {
+      let html = '<option value="">Choose a food…</option>';
+      if (snapIdx != null && !getFood(snaps[snapIdx].foodId)) {
+        html += `<option value="snap:${snapIdx}" selected>${esc(snaps[snapIdx].name)} (no longer in library)</option>`;
+      }
+      html += choices.map((c) => `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}${c.brand ? ' — ' + esc(c.brand) : ''}</option>`).join('');
+      return html;
+    };
+    const rowHtml = (ing, idx) => `<div class="ingredient-row">
+        <label class="field"><span>Ingredient</span><select class="ig-food">${optionsHtml(ing ? ing.foodId : '', ing ? idx : null)}</select></label>
+        <label class="field"><span>Grams</span><input class="ig-grams" inputmode="decimal" value="${ing ? inputVal(ing.grams) : ''}"></label>
+        <button type="button" class="btn ghost icon ig-remove" aria-label="Remove ingredient">✕</button>
+        <div class="mac muted ig-info"></div>
+      </div>`;
+    const body = `
+      <label class="field"><span>Recipe name *</span><input id="rc-name" value="${esc(f.name)}" autocomplete="off"></label>
+      <h3>Ingredients</h3>
+      ${choices.length ? '' : '<p class="msg info">Add the ingredients to your food library first, then combine them here.</p>'}
+      <div id="rc-rows">${snaps.length ? snaps.map(rowHtml).join('') : rowHtml(null, null)}</div>
+      <button type="button" class="btn small" id="rc-add">+ Add ingredient</button>
+      <div class="grid-2">
+        <label class="field"><span>Total cooked weight (g)</span><input id="rc-cooked" inputmode="decimal" value="${inputVal(f.recipe.cookedWeightG)}">
+          <span class="hint">Weigh the finished dish. Leave empty to use the raw ingredient total.</span></label>
+        <label class="field"><span>Portions (optional)</span><input id="rc-portions" inputmode="decimal" value="${inputVal(f.recipe.portions)}">
+          <span class="hint">Adds a “1 portion” serving size.</span></label>
+      </div>
+      <div class="preview" id="rc-summary"></div>
+      <div id="rc-errors"></div>`;
+    const foot = `${existing ? '<button type="button" class="btn danger" id="rc-delete">Delete</button><span class="grow"></span>' : ''}
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="button" class="btn primary" id="rc-save">Save recipe</button>`;
+    const dlg = modal.open(existing ? 'Edit recipe' : 'New recipe', body, foot);
+    const rowsEl = dlg.querySelector('#rc-rows');
+
+    const sourceFor = (val) => {
+      if (!val) return null;
+      if (val.startsWith('snap:')) { const sn = snaps[Number(val.slice(5))]; return sn ? { foodId: sn.foodId, name: sn.name, per100g: sn.per100g } : null; }
+      const lf = getFood(val);
+      return lf ? { foodId: lf.id, name: lf.name, per100g: normNutr(lf.per100g, NUTR_KEYS) } : null;
+    };
+    const read = () => {
+      const errors = [];
+      const ingredients = [];
+      rowsEl.querySelectorAll('.ingredient-row').forEach((row, i) => {
+        const sel = row.querySelector('.ig-food');
+        const gEl = row.querySelector('.ig-grams');
+        const src = sourceFor(sel.value);
+        const g = readNum(gEl);
+        const info = row.querySelector('.ig-info');
+        if (!src && g === null) { info.textContent = ''; return; }
+        if (!src) { errors.push(`Ingredient #${i + 1}: choose a food.`); info.textContent = ''; return; }
+        if (!isNum(g) || g <= 0) { errors.push(`Ingredient #${i + 1} (${src.name}): enter grams greater than 0.`); info.textContent = ''; return; }
+        const n = scaleNutrition(src.per100g, g);
+        info.innerHTML = `${fmtKcal(n.kcal)} kcal · ${macHtml(n)}`;
+        ingredients.push({ foodId: src.foodId, name: src.name, grams: g, per100g: clone(src.per100g) });
+      });
+      const cooked = readNum(dlg.querySelector('#rc-cooked'));
+      if (cooked !== null && (!isNum(cooked) || cooked <= 0)) errors.push('Cooked weight must be a number greater than 0, or empty.');
+      const portions = readNum(dlg.querySelector('#rc-portions'));
+      if (portions !== null && (!isNum(portions) || portions <= 0)) errors.push('Portions must be a number greater than 0, or empty.');
+      return { errors, ingredients, cooked: isNum(cooked) && cooked > 0 ? cooked : null, portions: isNum(portions) && portions > 0 ? portions : null };
+    };
+    const summary = () => {
+      const r = read();
+      const box = dlg.querySelector('#rc-summary');
+      if (!r.ingredients.length) { box.innerHTML = '<span class="muted">Add ingredients to see the nutrition.</span>'; return r; }
+      const c = computeRecipe(r.ingredients, r.cooked);
+      const ratio = r.cooked ? r.cooked / c.rawWeight : 1;
+      box.innerHTML = `<div><b>Whole recipe:</b> ${fmtKcal(c.totals.kcal)} kcal · <span class="mac">${macHtml(c.totals)}</span></div>
+        <div class="small muted">Raw ingredients ${fmtQty(c.rawWeight)} g${r.cooked ? ` → cooked ${fmtQty(r.cooked)} g (${Math.round(ratio * 100)}% of raw)` : ''}</div>
+        <div style="margin-top:6px"><b>Per 100 g ${r.cooked ? 'cooked' : ''}:</b> ${fmtKcal(c.per100g.kcal)} kcal · <span class="mac">${macHtml(c.per100g)}</span></div>
+        ${r.portions ? `<div><b>Per portion</b> (${fmtQty(c.weight / r.portions)} g): ${fmtKcal(c.totals.kcal / r.portions)} kcal · <span class="mac">${macHtml(scaleNutrition(c.per100g, c.weight / r.portions))}</span></div>` : ''}`;
+      return r;
+    };
+    dlg.querySelector('.modal-body').addEventListener('input', summary);
+    dlg.querySelector('.modal-body').addEventListener('change', summary);
+    dlg.querySelector('#rc-add').addEventListener('click', () => { rowsEl.insertAdjacentHTML('beforeend', rowHtml(null, null)); summary(); });
+    rowsEl.addEventListener('click', (ev) => {
+      const rm = ev.target.closest('.ig-remove');
+      if (rm) { rm.closest('.ingredient-row').remove(); summary(); }
+    });
+    const del = dlg.querySelector('#rc-delete');
+    if (del) del.addEventListener('click', async () => { if (await deleteFood(f.id)) { modal.close(); render(); } });
+    dlg.querySelector('#rc-save').addEventListener('click', () => {
+      const r = summary();
+      const name = dlg.querySelector('#rc-name').value.trim();
+      const errors = r.errors.slice();
+      if (!name) errors.unshift('Recipe name is required.');
+      if (!r.ingredients.length) errors.push('Add at least one ingredient.');
+      const box = dlg.querySelector('#rc-errors');
+      if (errors.length) {
+        box.innerHTML = `<div class="msg error"><b>Can't save yet:</b><ul>${errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>`;
+        return;
+      }
+      const c = computeRecipe(r.ingredients, r.cooked);
+      f.name = name;
+      f.source = 'recipe';
+      f.per100g = Object.assign(c.per100g, { fiber: null, sugar: null });
+      f.recipe = { ingredients: r.ingredients, cookedWeightG: r.cooked, portions: r.portions };
+      f.servings = [];
+      if (r.portions) f.servings.push({ label: `1 portion (1/${fmtQty(r.portions)} of recipe)`, grams: c.weight / r.portions });
+      f.servings.push({ label: 'Whole recipe', grams: c.weight });
+      upsertFood(f);
+      modal.close();
+      toast(existing ? 'Recipe updated. Past log entries keep their original values.' : 'Recipe saved.');
+      render();
+    });
+    summary();
+    if (!existing) dlg.querySelector('#rc-name').focus();
+  }
+  actions['new-recipe'] = () => openRecipeEditor(null);
+
   // ---------------------------------------------------------------------
   // Today view
   // ---------------------------------------------------------------------
@@ -1484,12 +1658,12 @@
       <div class="meal-head">
         <h2>${meal.label}</h2>
         <span class="kcal num">${fmtKcal(sub.kcal)} kcal</span>
-        ${mealToolsHtml(meal)}
         <button type="button" class="btn small primary" data-action="add-food" data-meal="${meal.key}" aria-label="Add food to ${meal.label}">+ Add</button>
       </div>
       ${list.length ? `<ul>${list.map(entryHtml).join('')}</ul>
         <div class="subtotal"><span>${meal.label} subtotal</span><span class="kcal num">${fmtKcal(sub.kcal)} kcal</span><span class="mac">${macHtml(sub)}</span></div>`
         : `<div class="empty">Nothing logged.</div>`}
+      ${mealToolsHtml(meal)}
     </section>`;
   }
 
@@ -2232,6 +2406,7 @@
     constants: { STORAGE_KEY, SCHEMA_VERSION, G_PER_OZ, KG_PER_LB, CM_PER_IN, ACTIVITY },
     scaleNutrition, sumNutrition, checkPer100g, calcBmr, calcTdee, calculatedTarget, currentTarget,
     defaultData, normalize, validateBackup, mergeData, parseNum, fmtKcal, fmtG, dateKey, addDays,
+    computeRecipe, normalizeOff, normalizeUsda,
     getData: () => data,
   };
 
@@ -2251,6 +2426,17 @@
       render();
     };
     document.addEventListener('visibilitychange', () => { if (!document.hidden) rollover(); });
+    // Charts are sized to their container, so redraw them when the width changes.
+    let resizeTimer = null;
+    let lastWidth = window.innerWidth;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (window.innerWidth === lastWidth) return;
+        lastWidth = window.innerWidth;
+        if ((ui.view === 'weight' || ui.view === 'history') && !document.getElementById('modal').open) render();
+      }, 200);
+    });
     setInterval(rollover, 60000);
     window.addEventListener('hashchange', () => {
       const h = location.hash.replace('#', '');

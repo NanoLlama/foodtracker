@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Food Tracker Tests</title>
+  <style>
+    :root { --bg: #fff; --text: #16181d; --pass: #18804a; --fail: #c62828; color-scheme: light dark; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #0f1115; --text: #e8eaee; --pass: #4ade80; --fail: #f87171; } }
+    body { background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 760px; padding: 16px; }
+    li.pass::marker { content: "✓  "; color: var(--pass); }
+    li.fail { color: var(--fail); }
+    li.fail::marker { content: "✗  "; }
+    #summary { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>Food Tracker — calculation tests</h1>
+  <p>Pure-logic checks for the accuracy rules and acceptance checklist. Open this file in a browser; it does not touch your saved data.</p>
+  <p id="summary">Running…</p>
+  <ol id="results"></ol>
+  <script src="app.js"></script>
+  <script>
+    (function () {
+      const F = window.FoodTracker;
+      const out = document.getElementById('results');
+      let pass = 0, fail = 0;
+      function test(name, fn) {
+        const li = document.createElement('li');
+        try { fn(); li.className = 'pass'; li.textContent = name; pass++; }
+        catch (e) { li.className = 'fail'; li.textContent = name + ' — ' + e.message; fail++; }
+        out.appendChild(li);
+      }
+      function eq(a, b, msg) { if (a !== b) throw new Error((msg || '') + ` expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`); }
+      function close(a, b, tol, msg) { if (Math.abs(a - b) > (tol || 1e-9)) throw new Error((msg || '') + ` expected ≈${b}, got ${a}`); }
+      const food = (kcal, protein, carbs, fat) => ({ kcal, protein, carbs, fat });
+
+      test('150 g of a 200 kcal/100 g food is exactly 300 kcal', () => {
+        eq(F.scaleNutrition(food(200, 10, 20, 5), 150).kcal, 300);
+      });
+      test('1.5 × "1 cup (240 g)" is 360 g and is calculated from 360 g', () => {
+        const grams = 1.5 * 240;
+        eq(grams, 360);
+        eq(F.scaleNutrition(food(50, 3.4, 4.8, 2), grams).kcal, 180);
+      });
+      test('1 oz = 28.3495 g', () => {
+        eq(F.constants.G_PER_OZ, 28.3495);
+        close(F.scaleNutrition(food(100, 0, 0, 0), 2 * F.constants.G_PER_OZ).kcal, 56.699);
+      });
+      test('Totals sum unrounded values and round once (not sum of rounded)', () => {
+        // Three entries of 0.4 kcal each: rounded individually they show 0, the total shows 1.
+        const n = F.scaleNutrition(food(40, 0.04, 0, 0), 1);
+        const total = F.sumNutrition([n, n, n]);
+        eq(F.fmtKcal(n.kcal), '0');
+        eq(F.fmtKcal(total.kcal), '1');
+        eq(F.fmtG(total.protein), '0.0');
+      });
+      test('Display rounding: kcal to whole numbers, macros to 1 decimal', () => {
+        eq(F.fmtKcal(283.495), '283');
+        eq(F.fmtG(12.25), '12.3');
+        eq(F.fmtG(-0.01), '0.0');
+      });
+      test('Mifflin-St Jeor (female) × multiplier − deficit matches hand calculation', () => {
+        const s = F.defaultData().settings;
+        s.profile = { sex: 'female', age: 30, heightCm: 167.64, weightKg: 68.0388555, activityLevel: 'moderate' };
+        s.deficit = 500;
+        const bmr = 10 * 68.0388555 + 6.25 * 167.64 - 5 * 30 - 161;
+        close(F.calcBmr(s.profile), bmr);
+        close(F.calculatedTarget(s), bmr * 1.55 - 500);
+      });
+      test('Mifflin-St Jeor (male) uses +5', () => {
+        const p = { sex: 'male', age: 40, heightCm: 180, weightKg: 90, activityLevel: 'sedentary' };
+        close(F.calcBmr(p), 900 + 1125 - 200 + 5);
+        close(F.calcTdee(p), (900 + 1125 - 200 + 5) * 1.2);
+      });
+      test('Activity multipliers are 1.2 / 1.375 / 1.55 / 1.725 / 1.9', () => {
+        eq(Object.values(F.constants.ACTIVITY).map((a) => a.factor).join(','), '1.2,1.375,1.55,1.725,1.9');
+      });
+      test('Manual override replaces calculated target; switching back restores it', () => {
+        const s = F.defaultData().settings;
+        s.profile = { sex: 'male', age: 40, heightCm: 180, weightKg: 90, activityLevel: 'sedentary' };
+        const calc = F.calculatedTarget(s);
+        s.targetMode = 'manual'; s.manualTarget = 1700;
+        eq(F.currentTarget(s), 1700);
+        s.targetMode = 'calculated';
+        eq(F.currentTarget(s), calc);
+      });
+      test('Missing nutrition is an error, never treated as 0', () => {
+        const r = F.checkPer100g({ kcal: null, protein: 1, carbs: 1, fat: 1 });
+        if (!r.errors.length) throw new Error('expected an error');
+      });
+      test('Negative values are rejected', () => {
+        if (!F.checkPer100g(food(100, -1, 10, 5)).errors.length) throw new Error('expected an error');
+      });
+      test('Warns above 900 kcal/100 g and on >20% 4/4/9 mismatch', () => {
+        const a = F.checkPer100g(food(950, 0, 0, 100));
+        if (!a.warnings.some((w) => /unusually high/.test(w))) throw new Error('no >900 warning');
+        const b = F.checkPer100g(food(500, 10, 20, 5)); // macros imply 165
+        if (!b.warnings.some((w) => /4\/4\/9/.test(w))) throw new Error('no mismatch warning');
+        eq(F.checkPer100g(food(265, 9, 49, 3.2)).warnings.length, 0, 'bread should be clean;');
+      });
+      test('Recipe per-100 g uses the cooked weight', () => {
+        const r = F.computeRecipe([
+          { grams: 200, per100g: food(350, 12, 70, 2) },   // dry pasta: 700 kcal
+          { grams: 100, per100g: food(100, 0, 0, 11.1) },  // 100 kcal
+        ], 600);
+        close(r.totals.kcal, 800);
+        close(r.per100g.kcal, 800 * 100 / 600);
+        close(F.computeRecipe(r && [{ grams: 300, per100g: food(100, 1, 1, 1) }], null).per100g.kcal, 100);
+      });
+      test('Open Food Facts: missing calories stay null; kJ is converted when kcal absent', () => {
+        const a = F.normalizeOff({ code: '1', product_name: 'A', nutriments: { proteins_100g: 1, carbohydrates_100g: 2, fat_100g: 3 } });
+        eq(a.per100g.kcal, null);
+        const b = F.normalizeOff({ code: '2', product_name: 'B', nutriments: { energy_100g: 418.4, proteins_100g: 0, carbohydrates_100g: 25, fat_100g: 0 } });
+        close(b.per100g.kcal, 100);
+        const c = F.normalizeOff({ code: '3', product_name: 'C', serving_quantity: 30, serving_size: '30 g', nutriments: { 'energy-kcal_100g': 400, proteins_100g: 10, carbohydrates_100g: 60, fat_100g: 10 } });
+        eq(c.servings[0].grams, 30);
+      });
+      test('USDA: nutrients mapped by number; missing macro stays null', () => {
+        const u = F.normalizeUsda({ fdcId: 1, description: 'X', foodNutrients: [
+          { nutrientNumber: '208', unitName: 'KCAL', value: 52 }, { nutrientNumber: '203', unitName: 'G', value: 0.3 },
+          { nutrientNumber: '204', unitName: 'G', value: 0.2 }] });
+        eq(u.per100g.kcal, 52); eq(u.per100g.protein, 0.3); eq(u.per100g.fat, 0.2); eq(u.per100g.carbs, null);
+      });
+      test('Backup validation rejects malformed files and accepts a valid one', () => {
+        if (!F.validateBackup({ foo: 1 }).length) throw new Error('accepted garbage');
+        if (!F.validateBackup(Object.assign(F.defaultData(), { schemaVersion: 99 })).length) throw new Error('accepted newer schema');
+        eq(F.validateBackup(F.defaultData()).length, 0);
+      });
+      test('normalize() round-trips a valid data object exactly', () => {
+        const d = F.defaultData();
+        d.foods.push({ id: 'f', name: 'N', brand: '', source: 'manual', sourceId: null, per100g: { kcal: 1, protein: 0, carbs: 0, fat: 0, fiber: null, sugar: null }, servings: [{ label: '1 x', grams: 5 }], recipe: null, createdAt: 'a', updatedAt: 'b' });
+        d.logs['2026-10-02'] = [{ id: 'e', meal: 'lunch', foodId: 'f', name: 'N', brand: '', grams: 5, unitLabel: '1 x', unitQty: 1, per100g: { kcal: 1, protein: 0, carbs: 0, fat: 0 }, servings: [{ label: '1 x', grams: 5 }], nutrition: { kcal: 0.05, protein: 0, carbs: 0, fat: 0 }, createdAt: 'c' }];
+        d.weights.push({ date: '2026-10-01', kg: 80.5 });
+        d.targetHistory.push({ from: '2026-10-01', kcal: 1800.25 });
+        eq(JSON.stringify(F.normalize(JSON.parse(JSON.stringify(d)))), JSON.stringify(d));
+      });
+      test('Merge de-duplicates by ID', () => {
+        const a = F.defaultData();
+        a.logs['2026-10-02'] = [{ id: 'e1', meal: 'lunch', grams: 1, nutrition: { kcal: 1, protein: 0, carbs: 0, fat: 0 } }];
+        const b = F.normalize(JSON.parse(JSON.stringify(a)));
+        b.logs['2026-10-02'].push(Object.assign({}, b.logs['2026-10-02'][0], { id: 'e2' }));
+        const m = F.mergeData(F.normalize(a), b);
+        eq(m.data.logs['2026-10-02'].length, 2);
+        eq(m.stats.entries, 1);
+      });
+      test('Local date keys and day arithmetic across month ends', () => {
+        eq(F.addDays('2026-10-01', -1), '2026-09-30');
+        eq(F.addDays('2026-12-31', 1), '2027-01-01');
+        eq(F.dateKey(new Date(2026, 9, 2, 23, 59)), '2026-10-02');
+      });
+
+      document.getElementById('summary').textContent = `${pass} passed, ${fail} failed`;
+      document.title = (fail ? 'FAIL' : 'PASS') + ' — Food Tracker Tests';
+    })();
+  </script>
+</body>
+</html>
