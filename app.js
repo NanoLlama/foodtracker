@@ -760,7 +760,7 @@
       <button type="button" class="btn small" id="fe-add-serving">+ Add serving size</button>
       <div id="fe-errors"></div>`;
     const foot = `${existing ? '<button type="button" class="btn danger" id="fe-delete">Delete</button><span class="grow"></span>' : ''}
-      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="button" class="btn" ${opts.onCancel ? 'id="fe-cancel"' : 'data-close'}>${opts.onCancel ? 'Back' : 'Cancel'}</button>
       <button type="button" class="btn primary" id="fe-save">${esc(opts.saveLabel || 'Save food')}</button>`;
     const dlg = modal.open(opts.title || (existing ? 'Edit food' : 'New food'), body, foot);
 
@@ -799,6 +799,8 @@
     if (del) del.addEventListener('click', async () => {
       if (await deleteFood(f.id)) { modal.close(); render(); }
     });
+    const cancel = dlg.querySelector('#fe-cancel');
+    if (cancel) cancel.addEventListener('click', () => opts.onCancel());
     dlg.querySelector('#fe-save').addEventListener('click', () => {
       const errors = [];
       const nameEl = dlg.querySelector('#fe-name');
@@ -857,6 +859,7 @@
         <div class="searchbar"><input type="search" id="food-search" placeholder="Search my foods" value="${esc(ui.foodQuery)}" autocomplete="off" aria-label="Search my foods"></div>
         <div class="row" id="food-tools">
           <button type="button" class="btn primary" data-action="new-food">+ New food</button>
+          <button type="button" class="btn" data-action="find-online">Find online</button>
         </div>
       </div>
       <div id="food-list"></div>`;
@@ -1058,12 +1061,20 @@
   // ---------------------------------------------------------------------
   // Add-food flow: search library, recents and online sources
   // ---------------------------------------------------------------------
-  const addState = { query: '', meal: 'breakfast', date: null, online: null };
+  // mode 'log' = add to the day's log; 'library' = find foods online to save to the library.
+  const addState = { mode: 'log', query: '', meal: 'breakfast', date: null, online: null };
 
   function openAddFood(meal) {
+    addState.mode = 'log';
     addState.meal = meal || (ui.date === todayKey() ? guessMeal() : 'breakfast');
     addState.date = ui.date;
     addState.query = '';
+    addState.online = null;
+    drawAddFood();
+  }
+  function openFindOnline() {
+    addState.mode = 'library';
+    addState.query = ui.foodQuery || '';
     addState.online = null;
     drawAddFood();
   }
@@ -1091,7 +1102,12 @@
   function addResultsHtml() {
     const q = addState.query.trim();
     let html = '';
-    if (!q) {
+    if (addState.mode === 'library') {
+      if (q) {
+        const lib = searchFoods(q);
+        if (lib.length) html += `<div class="section-label">Already in my foods</div><ul class="list">${lib.map(libraryRowHtml).join('')}</ul>`;
+      }
+    } else if (!q) {
       const rec = recentEntries();
       html += `<div class="section-label">Recent foods</div>` + (rec.length
         ? `<ul class="list">${rec.map(recentRowHtml).join('')}</ul><p class="small muted">Tap + to re-add the same amount in one tap.</p>`
@@ -1111,11 +1127,12 @@
   function drawAddFood() {
     const meal = addState.meal;
     const hasOnline = typeof searchOnline === 'function';
+    const logMode = addState.mode === 'log';
     const body = `
-      <div class="grid-2">
+      <div class="grid-2" ${logMode ? '' : 'hidden'}>
         <label class="field"><span>Meal</span><select id="af-meal">${MEALS.map((m) =>
           `<option value="${m.key}" ${m.key === meal ? 'selected' : ''}>${m.label}</option>`).join('')}</select></label>
-        <div class="field"><span>Day</span><div style="min-height:44px;display:flex;align-items:center"><b>${esc(fmtDate(addState.date, { weekday: 'short', month: 'short', day: 'numeric' }))}</b></div></div>
+        <div class="field"><span>Day</span><div style="min-height:44px;display:flex;align-items:center"><b>${logMode ? esc(fmtDate(addState.date, { weekday: 'short', month: 'short', day: 'numeric' })) : ''}</b></div></div>
       </div>
       <form class="searchbar" id="af-form" role="search">
         <input type="search" id="af-q" placeholder="${hasOnline ? 'Search foods or enter a barcode' : 'Search my foods'}" value="${esc(addState.query)}" autocomplete="off" aria-label="Search foods">
@@ -1123,8 +1140,28 @@
       </form>
       <div id="af-results">${addResultsHtml()}</div>`;
     const foot = `<button type="button" class="btn" id="af-manual">+ Create food manually</button>`;
-    const dlg = modal.open('Add food', body, foot);
+    const dlg = modal.open(logMode ? 'Add food' : 'Find food online', body, foot);
     bindAddFood(dlg);
+  }
+
+  /** After a food is saved from the add flow: log mode continues to the amount; library mode returns. */
+  function afterFoodSaved(f, back) {
+    if (addState.mode === 'library') {
+      modal.close();
+      toast(`Saved “${f.name}” to your library.`);
+      render();
+    } else {
+      openPortion({ src: foodSource(f), date: addState.date, meal: addState.meal, onBack: back });
+    }
+  }
+  function startManualFood(back) {
+    const draft = newFoodDraft();
+    draft.name = addState.query.trim();
+    openFoodEditor(draft, {
+      saveLabel: addState.mode === 'library' ? 'Save food' : 'Save & continue',
+      onCancel: back,
+      onSaved: (f) => afterFoodSaved(f, back),
+    });
   }
 
   function refreshAddResults() {
@@ -1158,21 +1195,239 @@
       const pick = ev.target.closest('[data-pick-food]');
       if (pick) {
         const f = getFood(pick.dataset.pickFood);
-        if (f) openPortion({ src: foodSource(f), date: addState.date, meal: addState.meal, onBack: backToSearch });
+        if (f && addState.mode === 'library') openFoodEditor(f, { onCancel: backToSearch });
+        else if (f) openPortion({ src: foodSource(f), date: addState.date, meal: addState.meal, onBack: backToSearch });
         return;
       }
       if (typeof handleOnlineClick === 'function') handleOnlineClick(ev, backToSearch);
     });
-    dlg.querySelector('#af-manual').addEventListener('click', () => {
-      const draft = newFoodDraft();
-      draft.name = addState.query.trim();
-      openFoodEditor(draft, {
-        saveLabel: 'Save & continue',
-        onSaved: (f) => openPortion({ src: foodSource(f), date: addState.date, meal: addState.meal, onBack: backToSearch }),
-      });
-    });
+    dlg.querySelector('#af-manual').addEventListener('click', () => startManualFood(backToSearch));
     qEl.focus();
   }
+
+
+  // ---------------------------------------------------------------------
+  // Online lookup: Open Food Facts (primary) and USDA FoodData Central (optional)
+  // ---------------------------------------------------------------------
+  const OFF_BASE = 'https://world.openfoodfacts.org';
+  const OFF_FIELDS = 'code,product_name,product_name_en,generic_name,brands,nutriments,serving_size,serving_quantity,serving_quantity_unit,product_quantity,product_quantity_unit,nutrition_data_per';
+  const USDA_BASE = 'https://api.nal.usda.gov/fdc/v1';
+  const isBarcode = (q) => /^\d{8,14}$/.test(q.replace(/[\s-]/g, ''));
+
+  async function fetchJson(url, timeoutMs = 15000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('The request timed out.');
+      throw new Error('Network error — check your connection.');
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      const err = new Error(res.status === 429 ? 'Too many searches — the service is rate-limiting. Wait a minute and try again.' : `The service responded with an error (HTTP ${res.status}).`);
+      err.status = res.status;
+      throw err;
+    }
+    try { return await res.json(); } catch (e) { throw new Error('The service returned an unreadable response.'); }
+  }
+
+  const toNum = (v) => {
+    if (isNum(v)) return v;
+    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
+    return null;
+  };
+  function addServing(list, label, grams) {
+    if (!isNum(grams) || grams <= 0 || !label) return;
+    if (list.some((s) => s.label === label)) return;
+    list.push({ label, grams });
+  }
+
+  /** Normalizes an Open Food Facts product to per-100 g values + servings. Missing values stay null. */
+  function normalizeOff(p) {
+    if (!isObj(p)) return null;
+    const n = isObj(p.nutriments) ? p.nutriments : {};
+    const v = (key) => toNum(n[key + '_100g']);
+    const notes = [];
+    let kcal = v('energy-kcal');
+    if (kcal == null) {
+      const kj = v('energy-kj') != null ? v('energy-kj') : v('energy');
+      if (kj != null) { kcal = kj / KJ_PER_KCAL; notes.push('Calories were converted from kilojoules (kJ ÷ 4.184).'); }
+    }
+    const per100g = {
+      kcal, protein: v('proteins'), carbs: v('carbohydrates'), fat: v('fat'), fiber: v('fiber'), sugar: v('sugars'),
+    };
+    const servings = [];
+    const sq = toNum(p.serving_quantity);
+    const squ = String(p.serving_quantity_unit || 'g').toLowerCase();
+    if (sq && (squ === 'g' || squ === 'ml')) addServing(servings, p.serving_size ? `1 serving (${String(p.serving_size).trim()})` : '1 serving', sq);
+    const pq = toNum(p.product_quantity);
+    const pqu = String(p.product_quantity_unit || 'g').toLowerCase();
+    if (pq && (pqu === 'g' || pqu === 'ml')) addServing(servings, `1 package (${fmtQty(pq)} ${pqu})`, pq);
+    if (String(p.nutrition_data_per || '').toLowerCase() === '100ml' || squ === 'ml' || pqu === 'ml') {
+      notes.push('This product is measured by volume; values are per 100 ml and are treated as per 100 g (exact for water-like liquids).');
+    }
+    const name = String(p.product_name || p.product_name_en || p.generic_name || '').trim();
+    return {
+      source: 'openfoodfacts',
+      sourceId: p.code ? String(p.code) : null,
+      name: name || 'Unnamed product',
+      brand: String(p.brands || '').split(',')[0].trim(),
+      per100g, servings, notes,
+    };
+  }
+
+  async function offSearch(q) {
+    const code = q.replace(/[\s-]/g, '');
+    if (isBarcode(q)) {
+      try {
+        const j = await fetchJson(`${OFF_BASE}/api/v2/product/${encodeURIComponent(code)}.json?fields=${OFF_FIELDS}`);
+        return j && j.product && (j.status === 1 || j.status === 'success') ? [normalizeOff(Object.assign({ code }, j.product))].filter(Boolean) : [];
+      } catch (e) {
+        if (e.status === 404) return [];
+        throw e;
+      }
+    }
+    const j = await fetchJson(`${OFF_BASE}/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=24&fields=${OFF_FIELDS}`);
+    return (Array.isArray(j && j.products) ? j.products : []).map(normalizeOff).filter(Boolean);
+  }
+
+  /** Normalizes a USDA FoodData Central search hit. foodNutrients in search results are per 100 g. */
+  function normalizeUsda(f) {
+    if (!isObj(f)) return null;
+    const byNum = {};
+    (Array.isArray(f.foodNutrients) ? f.foodNutrients : []).forEach((n) => {
+      const key = String(n.nutrientNumber || '');
+      const val = toNum(n.value);
+      if (key && val != null && !(key in byNum)) byNum[key] = { value: val, unit: String(n.unitName || '').toUpperCase() };
+    });
+    const get = (...keys) => { for (const k of keys) if (byNum[k]) return byNum[k].value; return null; };
+    const notes = [];
+    let kcal = null;
+    if (byNum['208'] && byNum['208'].unit === 'KCAL') kcal = byNum['208'].value;
+    else if (get('958', '957') != null) { kcal = get('958', '957'); notes.push('Calories use USDA’s Atwater-factor energy value.'); }
+    else if (get('268') != null) { kcal = get('268') / KJ_PER_KCAL; notes.push('Calories were converted from kilojoules (kJ ÷ 4.184).'); }
+    const per100g = {
+      kcal, protein: get('203'), carbs: get('205'), fat: get('204'), fiber: get('291'), sugar: get('269', '269.3'),
+    };
+    const servings = [];
+    const unit = String(f.servingSizeUnit || '').toLowerCase();
+    if (toNum(f.servingSize) && (unit === 'g' || unit === 'grm' || unit === 'ml' || unit === 'mlt')) {
+      addServing(servings, f.householdServingFullText ? `1 serving (${String(f.householdServingFullText).trim()})` : '1 serving', toNum(f.servingSize));
+      if (unit === 'ml' || unit === 'mlt') notes.push('Serving is measured in ml; treated as grams (exact for water-like liquids).');
+    }
+    (Array.isArray(f.foodMeasures) ? f.foodMeasures : []).slice(0, 10).forEach((m) => {
+      const label = String(m.disseminationText || '').trim();
+      if (label && !/quantity not specified/i.test(label)) addServing(servings, label, toNum(m.gramWeight));
+    });
+    const name = String(f.description || '').trim();
+    return {
+      source: 'usda',
+      sourceId: f.fdcId != null ? String(f.fdcId) : null,
+      name: name || 'Unnamed food',
+      brand: String(f.brandName || f.brandOwner || '').trim(),
+      per100g, servings, notes,
+      dataType: f.dataType || '',
+    };
+  }
+
+  async function usdaSearch(q) {
+    const key = data.settings.usdaApiKey;
+    const url = `${USDA_BASE}/foods/search?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(q)}&pageSize=25`;
+    try {
+      const j = await fetchJson(url);
+      return (Array.isArray(j && j.foods) ? j.foods : []).map(normalizeUsda).filter(Boolean);
+    } catch (e) {
+      if (e.status === 401 || e.status === 403) throw new Error('USDA rejected the API key. Check it in Settings.');
+      throw e;
+    }
+  }
+
+  function searchOnline(q) {
+    const run = { query: q, off: { status: 'loading' }, usda: data.settings.usdaApiKey ? { status: 'loading' } : null };
+    addState.online = run;
+    refreshAddResults();
+    const settle = (slot, promise) => promise
+      .then((results) => { run[slot] = { status: 'done', results }; })
+      .catch((e) => { run[slot] = { status: 'error', error: e && e.message ? e.message : String(e) }; })
+      .then(() => { if (addState.online === run) refreshAddResults(); });
+    settle('off', offSearch(q));
+    if (run.usda) settle('usda', usdaSearch(q));
+  }
+
+  function onlineRowHtml(r, slot, i) {
+    const missing = NUTR_KEYS.filter((k) => !isNum(r.per100g[k]));
+    return `<li><button type="button" class="list-item" data-online="${slot}:${i}">
+      <div class="title">${esc(r.name)}${missing.length ? ' <span class="badge missing">incomplete</span>' : ''}${r.notes.length ? ' <span class="badge warn">check</span>' : ''}</div>
+      <div class="sub">${r.brand ? esc(r.brand) + ' · ' : ''}${r.dataType ? esc(r.dataType) + ' · ' : ''}${per100Html(r.per100g)}${r.servings.length ? ` · ${r.servings.length} serving size${r.servings.length > 1 ? 's' : ''}` : ''}</div>
+    </button></li>`;
+  }
+
+  function onlineSectionHtml(slot, title) {
+    const st = addState.online[slot];
+    if (!st) return '';
+    let inner;
+    if (st.status === 'loading') inner = `<div class="list-empty">Searching…</div>`;
+    else if (st.status === 'error') {
+      inner = `<div class="msg error"><b>${esc(title)} lookup failed:</b> ${esc(st.error)}
+        <div class="row" style="margin-top:8px"><button type="button" class="btn small" data-retry-online>Try again</button>
+        <button type="button" class="btn small" data-manual-fallback>Enter food manually</button></div></div>`;
+    } else if (!st.results.length) inner = `<div class="list-empty">No results. <button type="button" class="btn small" data-manual-fallback>Enter food manually</button></div>`;
+    else inner = `<ul class="list">${st.results.map((r, i) => onlineRowHtml(r, slot, i)).join('')}</ul>`;
+    return `<div class="section-label">${esc(title)}</div>${inner}`;
+  }
+
+  function onlineResultsHtml() {
+    const q = addState.query.trim();
+    const sources = 'Open Food Facts' + (data.settings.usdaApiKey ? ' and USDA' : '');
+    if (!addState.online || addState.online.query !== q) {
+      if (!q) return addState.mode === 'library' ? `<p class="small muted">Type a food name or a barcode number, then search ${sources}.</p>` : '';
+      return `<div class="section-label">Online</div>
+        <button type="button" class="btn block" data-search-online>${isBarcode(q) ? 'Look up barcode' : 'Search'} “${esc(q)}” in ${sources}</button>`;
+    }
+    return onlineSectionHtml('off', isBarcode(q) ? 'Open Food Facts — barcode' : 'Open Food Facts') + onlineSectionHtml('usda', 'USDA FoodData Central') +
+      `<p class="small muted">Values are shown per 100 g. Results marked <span class="badge missing">incomplete</span> need missing values filled in before saving.</p>`;
+  }
+
+  function pickOnline(r, back) {
+    const existing = r.sourceId && data.foods.find((f) => f.source === r.source && f.sourceId === r.sourceId);
+    if (existing) {
+      toast('Already in your library — using your saved version.');
+      if (addState.mode === 'library') openFoodEditor(existing, { onCancel: back });
+      else openPortion({ src: foodSource(existing), date: addState.date, meal: addState.meal, onBack: back });
+      return;
+    }
+    const draft = newFoodDraft();
+    Object.assign(draft, {
+      name: r.name, brand: r.brand, source: r.source, sourceId: r.sourceId,
+      per100g: clone(r.per100g), servings: clone(r.servings),
+    });
+    openFoodEditor(draft, {
+      title: 'Review & save',
+      saveLabel: addState.mode === 'library' ? 'Save to library' : 'Save to library & continue',
+      notes: r.notes,
+      onCancel: back,
+      onSaved: (f) => afterFoodSaved(f, back),
+    });
+  }
+
+  function handleOnlineClick(ev, back) {
+    if (ev.target.closest('[data-search-online]') || ev.target.closest('[data-retry-online]')) {
+      const q = addState.query.trim();
+      if (q) searchOnline(q);
+      return;
+    }
+    if (ev.target.closest('[data-manual-fallback]')) { startManualFood(back); return; }
+    const btn = ev.target.closest('[data-online]');
+    if (!btn || !addState.online) return;
+    const [slot, i] = btn.dataset.online.split(':');
+    const st = addState.online[slot];
+    const r = st && st.results && st.results[Number(i)];
+    if (r) pickOnline(r, back);
+  }
+  actions['find-online'] = openFindOnline;
 
   // ---------------------------------------------------------------------
   // Today view
