@@ -694,14 +694,273 @@
     </div>`;
   }
 
+  // ---------- Unit conversion helpers for display ----------
+  const kgToDisplay = (kg) => (data.settings.units.weight === 'lb' ? kg / KG_PER_LB : kg);
+  const displayToKg = (v) => (data.settings.units.weight === 'lb' ? v * KG_PER_LB : v);
+  const weightUnit = () => data.settings.units.weight;
+  function fmtWeight(kg) { return isNum(kg) ? fmtG(kgToDisplay(kg)) + ' ' + weightUnit() : '—'; }
+
+  function fmtSigned(v, fmt) {
+    if (!isNum(v)) return '—';
+    const s = fmt(Math.abs(v));
+    if (Number(s.replace(/,/g, '')) === 0) return fmt(0);
+    return (v > 0 ? '+' : '−') + s;
+  }
+
+  function targetBreakdownHtml(settings) {
+    const p = settings.profile;
+    const bmr = calcBmr(p);
+    const act = ACTIVITY[p.activityLevel];
+    const tdee = calcTdee(p);
+    const calc = calculatedTarget(settings);
+    const active = currentTarget(settings);
+    let html = '';
+    if (bmr == null) {
+      html += `<p class="msg info">Enter sex, age, height and current weight to calculate your target.</p>`;
+    } else {
+      const sexTerm = p.sex === 'male' ? '+ 5' : '− 161';
+      html += `<table class="breakdown">
+        <tr><td>BMR (Mifflin-St Jeor)<br><span class="small muted">10 × ${fmtQty(p.weightKg)} kg + 6.25 × ${fmtQty(p.heightCm)} cm − 5 × ${fmtQty(p.age)} ${sexTerm}</span></td><td>${fmtKcal(bmr)} kcal</td></tr>
+        <tr><td>TDEE<br><span class="small muted">BMR × ${act.factor} (${esc(act.label.split(' (')[0])})</span></td><td>${fmtKcal(tdee)} kcal</td></tr>
+        <tr><td>Daily deficit</td><td>− ${isNum(settings.deficit) ? fmtKcal(settings.deficit) : '—'} kcal</td></tr>
+        <tr class="${settings.targetMode === 'calculated' ? 'total' : ''}"><td>Calculated target</td><td>${fmtKcal(calc)} kcal</td></tr>
+      </table>`;
+    }
+    if (settings.targetMode === 'manual') {
+      html += `<table class="breakdown"><tr class="total"><td>Manual target <span class="badge">override</span></td><td>${fmtKcal(settings.manualTarget)} kcal</td></tr></table>`;
+    }
+    if (isNum(active)) {
+      const min = minimumFor(p.sex);
+      if (active < min) {
+        html += `<p class="msg warn">A target of ${fmtKcal(active)} kcal is below the commonly cited minimum of about ${min.toLocaleString()} kcal/day${p.sex ? ` for ${p.sex === 'male' ? 'men' : 'women'}` : ''}. Consider checking with a doctor or registered dietitian.</p>`;
+      }
+    }
+    return html;
+  }
+
+  function settingsFormHtml() {
+    const s = data.settings;
+    const p = s.profile;
+    const u = s.units;
+    let heightFields;
+    if (u.height === 'in') {
+      const totalIn = isNum(p.heightCm) ? p.heightCm / CM_PER_IN : null;
+      const ft = totalIn == null ? '' : Math.floor(totalIn / 12 + 1e-9);
+      const inch = totalIn == null ? '' : inputVal(totalIn - ft * 12);
+      heightFields = `<div class="grid-2">
+        <label class="field"><span>Height (ft)</span><input id="s-height-ft" inputmode="numeric" value="${ft}" data-height></label>
+        <label class="field"><span>(in)</span><input id="s-height-in" inputmode="decimal" value="${inch}" data-height></label></div>`;
+    } else {
+      heightFields = `<label class="field"><span>Height (cm)</span><input id="s-height-cm" inputmode="decimal" value="${inputVal(p.heightCm)}" data-height></label>`;
+    }
+    const weightVal = isNum(p.weightKg) ? inputVal(kgToDisplay(p.weightKg)) : '';
+    return `<form class="card" id="settings-form" novalidate>
+      <div class="card-head"><h2>Profile &amp; calorie target</h2></div>
+      <div class="row">
+        <span class="small muted">Weight</span>
+        <div class="segmented" role="radiogroup" aria-label="Weight unit">
+          <label><input type="radio" name="u-weight" value="lb" ${u.weight === 'lb' ? 'checked' : ''}><span>lb</span></label>
+          <label><input type="radio" name="u-weight" value="kg" ${u.weight === 'kg' ? 'checked' : ''}><span>kg</span></label>
+        </div>
+        <span class="small muted">Height</span>
+        <div class="segmented" role="radiogroup" aria-label="Height unit">
+          <label><input type="radio" name="u-height" value="in" ${u.height === 'in' ? 'checked' : ''}><span>ft/in</span></label>
+          <label><input type="radio" name="u-height" value="cm" ${u.height === 'cm' ? 'checked' : ''}><span>cm</span></label>
+        </div>
+      </div>
+      <div class="grid-2">
+        <label class="field"><span>Sex (for BMR formula)</span>
+          <select id="s-sex"><option value="">Select…</option>
+            <option value="female" ${p.sex === 'female' ? 'selected' : ''}>Female</option>
+            <option value="male" ${p.sex === 'male' ? 'selected' : ''}>Male</option></select></label>
+        <label class="field"><span>Age (years)</span><input id="s-age" inputmode="numeric" value="${inputVal(p.age)}"></label>
+      </div>
+      ${heightFields}
+      <div class="grid-2">
+        <label class="field"><span>Current weight (${u.weight})</span><input id="s-weight" inputmode="decimal" value="${weightVal}"></label>
+        <label class="field"><span>Daily deficit (kcal)</span><input id="s-deficit" inputmode="numeric" value="${inputVal(s.deficit)}"></label>
+      </div>
+      <label class="field"><span>Activity level</span>
+        <select id="s-activity">${Object.keys(ACTIVITY).map((k) =>
+          `<option value="${k}" ${p.activityLevel === k ? 'selected' : ''}>${esc(ACTIVITY[k].label)} — × ${ACTIVITY[k].factor}</option>`).join('')}</select></label>
+
+      <div class="field">
+        <span>Daily target</span>
+        <div class="segmented" role="radiogroup" aria-label="Target mode">
+          <label><input type="radio" name="t-mode" value="calculated" ${s.targetMode === 'calculated' ? 'checked' : ''}><span>Calculated</span></label>
+          <label><input type="radio" name="t-mode" value="manual" ${s.targetMode === 'manual' ? 'checked' : ''}><span>Manual override</span></label>
+        </div>
+      </div>
+      <label class="field" id="manual-wrap" ${s.targetMode === 'manual' ? '' : 'hidden'}><span>Manual target (kcal/day)</span>
+        <input id="s-manual" inputmode="numeric" value="${inputVal(s.manualTarget)}">
+        <span class="hint">Replaces the calculated target. Switch back to “Calculated” any time — your profile is kept.</span></label>
+
+      <div id="breakdown">${targetBreakdownHtml(s)}</div>
+      <p class="small muted">The target is a fixed daily budget — exercise does not add calories back.</p>
+
+      <h3>Macro targets (optional, grams per day)</h3>
+      <div class="grid-3">
+        <label class="field"><span>Protein (g)</span><input id="s-mp" inputmode="decimal" value="${inputVal(s.macroTargets.protein)}"></label>
+        <label class="field"><span>Carbs (g)</span><input id="s-mc" inputmode="decimal" value="${inputVal(s.macroTargets.carbs)}"></label>
+        <label class="field"><span>Fat (g)</span><input id="s-mf" inputmode="decimal" value="${inputVal(s.macroTargets.fat)}"></label>
+      </div>
+      <p class="small muted" id="macro-kcal"></p>
+      <div id="settings-errors"></div>
+      <div class="row end"><button type="submit" class="btn primary">Save settings</button></div>
+    </form>`;
+  }
+
+  /** Reads the settings form into a candidate settings object. Returns {settings, errors}. */
+  function readSettingsForm(form) {
+    const s = clone(data.settings);
+    const errors = [];
+    const q = (sel) => form.querySelector(sel);
+    const mark = (el, bad) => el && el.classList.toggle('invalid', !!bad);
+    const field = (el, label, { required = false, min = 0, max = Infinity, integer = false } = {}) => {
+      const v = readNum(el);
+      let bad = false;
+      if (v === null) { if (required) { errors.push(`${label} is required.`); bad = true; } }
+      else if (Number.isNaN(v)) { errors.push(`${label} must be a number.`); bad = true; }
+      else if (v < min) { errors.push(`${label} can't be ${min === 0 ? 'negative' : 'less than ' + min}.`); bad = true; }
+      else if (v > max) { errors.push(`${label} looks too large.`); bad = true; }
+      else if (integer && !Number.isInteger(v)) { errors.push(`${label} must be a whole number.`); bad = true; }
+      mark(el, bad);
+      return bad ? undefined : v;
+    };
+
+    s.profile.sex = q('#s-sex').value || null;
+    const age = field(q('#s-age'), 'Age', { min: 1, max: 120 });
+    if (age !== undefined) s.profile.age = age;
+
+    // Only recompute stored height/weight if the user edited them (avoids unit round-trip drift).
+    if (form.dataset.heightDirty === '1') {
+      if (q('#s-height-cm')) {
+        const cm = field(q('#s-height-cm'), 'Height', { min: 30, max: 272 });
+        if (cm !== undefined) s.profile.heightCm = cm;
+      } else {
+        const ftEl = q('#s-height-ft');
+        const inEl = q('#s-height-in');
+        const ft = field(ftEl, 'Height (ft)', { max: 8 });
+        const inch = field(inEl, 'Height (in)', { max: 120 });
+        if (ft !== undefined && inch !== undefined) {
+          if (ft === null && inch === null) s.profile.heightCm = null;
+          else {
+            const totalIn = (ft || 0) * 12 + (inch || 0);
+            if (totalIn < 12) { errors.push('Height looks too small.'); mark(ftEl, true); }
+            else s.profile.heightCm = totalIn * CM_PER_IN;
+          }
+        }
+      }
+    }
+    if (form.dataset.weightDirty === '1') {
+      const w = field(q('#s-weight'), 'Current weight', { min: 0.1, max: 1500 });
+      if (w !== undefined) s.profile.weightKg = w === null ? null : displayToKg(w);
+    }
+    s.profile.activityLevel = q('#s-activity').value;
+    const def = field(q('#s-deficit'), 'Daily deficit', { required: true, max: 5000 });
+    if (def !== undefined) s.deficit = def;
+
+    s.targetMode = form.querySelector('input[name="t-mode"]:checked').value;
+    const manualRequired = s.targetMode === 'manual';
+    const mt = field(q('#s-manual'), 'Manual target', { required: manualRequired, min: manualRequired ? 1 : 0, max: 20000 });
+    if (mt !== undefined) s.manualTarget = mt;
+
+    const mp = field(q('#s-mp'), 'Protein target', { max: 1000 });
+    const mc = field(q('#s-mc'), 'Carbs target', { max: 2000 });
+    const mf = field(q('#s-mf'), 'Fat target', { max: 1000 });
+    if (mp !== undefined) s.macroTargets.protein = mp;
+    if (mc !== undefined) s.macroTargets.carbs = mc;
+    if (mf !== undefined) s.macroTargets.fat = mf;
+    return { settings: s, errors };
+  }
+
+  function macroKcalNote(settings) {
+    const m = settings.macroTargets;
+    if (!isNum(m.protein) || !isNum(m.carbs) || !isNum(m.fat)) return '';
+    const kcal = 4 * m.protein + 4 * m.carbs + 9 * m.fat;
+    const t = currentTarget(settings);
+    return `Macro targets add up to ${fmtKcal(kcal)} kcal (4/4/9)` + (isNum(t) ? ` vs. a ${fmtKcal(t)} kcal target.` : '.');
+  }
+
+  function renderApiCard() {
+    return `<form class="card" id="api-form">
+      <h2>Online lookup</h2>
+      <p class="small muted">Open Food Facts is always available (no key needed). To also search USDA FoodData Central, paste a free API key from <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">fdc.nal.usda.gov</a>.</p>
+      <label class="field"><span>USDA FoodData Central API key</span>
+        <input id="s-usda" type="password" autocomplete="off" spellcheck="false" value="${esc(data.settings.usdaApiKey)}" placeholder="Not set — USDA search hidden"></label>
+      <div class="row end">
+        ${data.settings.usdaApiKey ? '<button type="button" class="btn" id="usda-clear">Remove key</button>' : ''}
+        <button type="submit" class="btn primary">Save key</button>
+      </div>
+    </form>`;
+  }
+
   views.settings = function (root) {
-    root.innerHTML = `${renderBackupCard()}
+    root.innerHTML = `${settingsFormHtml()}
+      ${renderApiCard()}
+      ${renderBackupCard()}
       <div class="card">
         <h2>Erase data</h2>
         <p class="small muted">Removes everything stored by this app in this browser.</p>
         <button type="button" class="btn danger" data-action="erase-all">Erase all data…</button>
       </div>`;
     bindSettingsCommon(root);
+
+    const form = root.querySelector('#settings-form');
+    const live = () => {
+      const { settings } = readSettingsForm(form);
+      form.querySelector('#breakdown').innerHTML = targetBreakdownHtml(settings);
+      form.querySelector('#macro-kcal').textContent = macroKcalNote(settings);
+      form.querySelector('#manual-wrap').hidden = settings.targetMode !== 'manual';
+    };
+    form.addEventListener('input', (ev) => {
+      if (ev.target.matches('[data-height]')) form.dataset.heightDirty = '1';
+      if (ev.target.id === 's-weight') form.dataset.weightDirty = '1';
+      if (ev.target.name === 'u-weight' || ev.target.name === 'u-height') return;
+      live();
+    });
+    form.addEventListener('change', (ev) => {
+      // Unit switches apply immediately; stored values are metric so nothing is converted.
+      if (ev.target.name === 'u-weight' || ev.target.name === 'u-height') {
+        const key = ev.target.name === 'u-weight' ? 'weight' : 'height';
+        data.settings.units[key] = ev.target.value;
+        saveData();
+        render();
+      } else {
+        live();
+      }
+    });
+    form.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const { settings, errors } = readSettingsForm(form);
+      const errBox = form.querySelector('#settings-errors');
+      if (errors.length) {
+        errBox.innerHTML = `<div class="msg error"><b>Not saved:</b><ul>${errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>`;
+        return;
+      }
+      data.settings = settings;
+      syncTargetHistory();
+      saveData();
+      toast('Settings saved.');
+      render();
+    });
+    form.querySelector('#macro-kcal').textContent = macroKcalNote(data.settings);
+
+    const api = root.querySelector('#api-form');
+    api.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      data.settings.usdaApiKey = api.querySelector('#s-usda').value.trim();
+      saveData();
+      toast(data.settings.usdaApiKey ? 'USDA key saved — USDA results will appear in search.' : 'USDA key removed.');
+      render();
+    });
+    const clear = api.querySelector('#usda-clear');
+    if (clear) clear.addEventListener('click', () => {
+      data.settings.usdaApiKey = '';
+      saveData();
+      toast('USDA key removed.');
+      render();
+    });
   };
 
   function bindSettingsCommon(root) {
